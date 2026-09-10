@@ -71,6 +71,9 @@ What it guarantees:
   copies the keeper back over each link and restores independent files.
 - **Re-running plans nothing.** Files already sharing an inode are reported as
   already-linked.
+- **ReadOnly targets are handled.** Windows refuses to rename over a read-only
+  file. Since the bytes are already verified identical, the attribute is cleared
+  and the rename retried.
 
 What it refuses to link, because a hard link is only safe when tools *replace* a
 file rather than *modify it in place*: databases, VM disks, logs, lock files,
@@ -96,6 +99,10 @@ config.ts   optional; defaults are correct on main
 Every action takes an injectable runner, so the tests drive a fake `es.exe` and
 assert on real values without a mocking library.
 
+`--quick` swaps the full hash for a 1 MB head+tail sample. It is much faster and
+it is a heuristic — a false match is not recoverable, because undo restores the
+keeper's bytes. Use it to explore, not to delete.
+
 ## Two things that will bite you in `es.exe`
 
 Both are pinned as tests, because prose cannot fail and a test can.
@@ -103,7 +110,9 @@ Both are pinned as tests, because prose cannot fail and a test can.
 **Instance names, not sessions.** A bare `es.exe` run over SSH fails with
 `Error 8: Everything IPC not found` even while Everything is running. Everything
 1.5a registers under the IPC instance name `1.5a` rather than the unnamed
-default. Every call here passes `-instance`.
+default. Every call here passes `-instance`, and falls back through the other
+known names on Error 8 so an Everything upgrade does not break every command.
+`ev doctor` reports which instance actually answered.
 
 **Search terms must be separate argv tokens.** ES joins multiple non-switch
 arguments into one search, but a single argument containing spaces is treated as

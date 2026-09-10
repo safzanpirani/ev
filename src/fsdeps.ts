@@ -56,5 +56,8 @@ export function makeFsDeps(opts: { quick?: boolean } = {}): LinkDeps {
     rename: (from, to) => fs.rename(from, to),
     unlink: (path) => fs.unlink(path),
     copy: (from, to) => fs.copyFile(from, to),
+    // On Windows, chmod only toggles the read-only bit, which is exactly what
+    // a rename over a ReadOnly target needs cleared.
+    makeWritable: (path) => fs.chmod(path, 0o666),
   };
 }

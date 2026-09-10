@@ -23,6 +23,8 @@ export interface LinkDeps {
   rename: (from: string, to: string) => Promise<void>;
   unlink: (path: string) => Promise<void>;
   copy: (from: string, to: string) => Promise<void>;
+  /** Clear a target's read-only attribute so a rename can replace it. */
+  makeWritable?: (path: string) => Promise<void>;
   now?: () => string;
 }
 
@@ -246,7 +248,17 @@ export async function applyLinks(plan: LinkPlan, deps: LinkDeps): Promise<ApplyR
       const tmp = `${target}.evlink-tmp`;
       try {
         await deps.link(g.keeper, tmp);
-        await deps.rename(tmp, target);
+        try {
+          await deps.rename(tmp, target);
+        } catch (renameErr) {
+          // Windows refuses to rename over a file carrying the ReadOnly
+          // attribute. The bytes are already verified identical, so clearing it
+          // and retrying is safe. The resulting link shares the keeper's inode,
+          // and therefore the keeper's attributes — there is nothing to restore.
+          if (!deps.makeWritable) throw renameErr;
+          await deps.makeWritable(target);
+          await deps.rename(tmp, target);
+        }
         entries.push({ keeper: g.keeper, linked: target, size: g.size, hash: g.hash });
         reclaimed += g.size;
       } catch (err) {

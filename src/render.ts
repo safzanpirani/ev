@@ -48,6 +48,21 @@ export function renderDu(d: DuResult): string {
   return lines.join("\n");
 }
 
+export function renderDuTree(t: import("./core.ts").DuTreeResult): string {
+  const lines: string[] = [];
+  const walk = (nodes: import("./core.ts").DuEntryTree[]) => {
+    for (const n of nodes) {
+      const indent = "  ".repeat(n.depth);
+      const marker = n.kind === "folder" ? "/" : " ";
+      lines.push(`${pad(humanSize(n.size), 8)}  ${indent}${marker} ${n.name}`);
+      if (n.children) walk(n.children);
+    }
+  };
+  walk(t.entries);
+  lines.push(`-- ${t.root}: ${humanSize(t.grandTotal)} total, expanded ${t.depth} level${t.depth === 1 ? "" : "s"}.`);
+  return lines.join("\n");
+}
+
 export function renderExt(r: { entries: ExtEntry[]; scanned: number; total: number; sampled: boolean }, limit: number): string {
   const lines: string[] = [];
   for (const e of r.entries.slice(0, limit)) {
@@ -85,7 +100,9 @@ export function renderDoctor(d: DoctorReport): string {
   return [
     `ev: ok`,
     `  es.exe:   ${d.exe}`,
-    `  instance: ${d.instance}`,
+    d.requested && d.requested !== d.instance
+      ? `  instance: ${d.instance}  (configured ${JSON.stringify(d.requested)} did not answer — set $EV_INSTANCE)`
+      : `  instance: ${d.instance}`,
     d.everythingVersion ? `  Everything: ${d.everythingVersion}` : `  Everything: (version not reported)`,
     `  indexed:  ${(d.indexedFiles ?? 0).toLocaleString()} items`,
   ].join("\n");

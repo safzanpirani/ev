@@ -223,6 +223,50 @@ describe("applyLinks", () => {
   });
 });
 
+describe("read-only targets", () => {
+  // Windows refuses to rename over a ReadOnly file. One such file out of 198
+  // was the only failure on the first real run against main.
+  test("a rename refused by ReadOnly is retried after clearing the attribute", async () => {
+    const { deps, fs, ops } = fakeFs({
+      "F:\\a\\s.exe": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "F:\\b\\s.exe": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const plan = await planLinks([group(["F:\\a\\s.exe", "F:\\b\\s.exe"], 10 * MB)], deps);
+
+    let readOnly = true;
+    const realRename = deps.rename;
+    deps.rename = async (from, to) => {
+      if (readOnly) throw new Error("EPERM: operation not permitted");
+      return realRename(from, to);
+    };
+    deps.makeWritable = async (path) => {
+      ops.push(`makeWritable ${path}`);
+      readOnly = false;
+    };
+
+    const r = await applyLinks(plan, deps);
+    expect(r.linked).toBe(1);
+    expect(r.failures).toHaveLength(0);
+    expect(ops).toContain("makeWritable F:\\b\\s.exe");
+    expect(fs["F:\\b\\s.exe"]!.ino).toBe("1");
+  });
+
+  test("without a makeWritable dep the original error still surfaces", async () => {
+    const { deps } = fakeFs({
+      "F:\\a\\s.exe": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "F:\\b\\s.exe": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const plan = await planLinks([group(["F:\\a\\s.exe", "F:\\b\\s.exe"], 10 * MB)], deps);
+    deps.rename = async () => {
+      throw new Error("EPERM: operation not permitted");
+    };
+    delete deps.makeWritable;
+    const r = await applyLinks(plan, deps);
+    expect(r.linked).toBe(0);
+    expect(r.failures[0]!.error).toContain("EPERM");
+  });
+});
+
 describe("undoLinks", () => {
   test("restores an independent copy at the linked path", async () => {
     const { deps, ops, fs } = fakeFs({

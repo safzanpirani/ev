@@ -58,13 +58,47 @@ export interface EsClient {
   totalSize(query: string[]): Promise<number>;
   raw(args: string[]): Promise<string>;
   version(): Promise<string>;
+  /** The instance name that actually answered, after any fallback. */
+  resolvedInstance(): string;
 }
 
+/**
+ * Instance names to try when the configured one does not answer.
+ *
+ * Everything registers its IPC window under a version-shaped instance name
+ * ("1.5a" today). An upgrade changes that name and would otherwise break every
+ * command with a bare "Error 8", so a failure falls back through these before
+ * giving up. The empty string is the unnamed default used by Everything 1.4.
+ */
+const FALLBACK_INSTANCES = ["1.5a", "1.5", "1.4", "", "Everything"];
+
 export function makeClient(exe: string, instance: string, run: Runner = defaultRunner): EsClient {
-  const base = instance ? ["-instance", instance] : [];
+  // Resolved once per process: the fast path never pays for the fallback.
+  let resolved = instance;
+  let probed = false;
+
+  function argsFor(name: string, args: string[]): string[] {
+    return name ? ["-instance", name, ...args] : args;
+  }
 
   async function call(args: string[]): Promise<string> {
-    const r = await run(exe, [...base, ...args]);
+    let r = await run(exe, argsFor(resolved, args));
+
+    // Error 8 means no Everything answered under that instance name. Try the
+    // others once before reporting failure, and keep whichever one works.
+    if (!r.ok && r.code === 8 && !probed) {
+      probed = true;
+      for (const candidate of FALLBACK_INSTANCES) {
+        if (candidate === resolved) continue;
+        const attempt = await run(exe, argsFor(candidate, args));
+        if (attempt.ok) {
+          resolved = candidate;
+          r = attempt;
+          break;
+        }
+      }
+    }
+
     if (!r.ok) {
       // errorlevel 9 (no results) is only set with -no-result-error; treat as empty.
       if (r.code === 9) return "";
@@ -102,5 +136,6 @@ export function makeClient(exe: string, instance: string, run: Runner = defaultR
     },
     raw: (args) => call(args),
     version: () => call(["-get-everything-version"]),
+    resolvedInstance: () => resolved,
   };
 }

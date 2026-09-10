@@ -37,12 +37,24 @@ export interface DuEntry {
   kind: "folder" | "file";
 }
 
+export interface DuEntryTree extends DuEntry {
+  depth: number;
+  children?: DuEntryTree[];
+}
+
 export interface DuResult {
   root: string;
   entries: DuEntry[];
   folderTotal: number;
   fileTotal: number;
   grandTotal: number;
+}
+
+export interface DuTreeResult {
+  root: string;
+  entries: DuEntryTree[];
+  grandTotal: number;
+  depth: number;
 }
 
 function leafName(p: string): string {
@@ -149,7 +161,9 @@ export async function dupes(
 export interface DoctorReport {
   ok: boolean;
   exe: string;
+  /** The instance that answered. Differs from `requested` when a fallback won. */
   instance: string;
+  requested?: string;
   everythingVersion?: string;
   indexedFiles?: number;
   error?: string;
@@ -158,14 +172,47 @@ export interface DoctorReport {
 export async function doctor(es: EsClient, exe: string, instance: string): Promise<DoctorReport> {
   try {
     const indexedFiles = await es.count([]);
+    const actual = es.resolvedInstance();
     let everythingVersion: string | undefined;
     try {
       everythingVersion = (await es.version()).trim() || undefined;
     } catch {
       // Not every instance answers -get-everything-version; not fatal.
     }
-    return { ok: true, exe, instance, everythingVersion, indexedFiles };
+    return { ok: true, exe, instance: actual, requested: instance, everythingVersion, indexedFiles };
   } catch (err) {
     return { ok: false, exe, instance, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+
+/**
+ * Recursive rollup. Each level is one indexed query, so depth is cheap — but
+ * the branching is not, so only folders holding at least `minShare` of their
+ * parent are expanded. That keeps "what is eating this drive" to the few
+ * branches that actually answer it instead of walking the whole tree.
+ */
+export async function duTree(
+  es: EsClient,
+  root: string,
+  depth = 2,
+  perLevel = 12,
+  minShare = 0.02,
+): Promise<DuTreeResult> {
+  async function level(path: string, remaining: number, d: number): Promise<DuEntryTree[]> {
+    const r = await du(es, path, perLevel);
+    const out: DuEntryTree[] = [];
+    for (const e of r.entries) {
+      const node: DuEntryTree = { ...e, depth: d };
+      if (remaining > 1 && e.kind === "folder" && e.size >= r.grandTotal * minShare) {
+        node.children = await level(e.path, remaining - 1, d + 1);
+      }
+      out.push(node);
+    }
+    return out;
+  }
+
+  const entries = await level(root, depth, 0);
+  const grandTotal = entries.reduce((sum, e) => sum + e.size, 0);
+  return { root, entries, grandTotal, depth };
 }

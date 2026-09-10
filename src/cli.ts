@@ -4,8 +4,8 @@
 import { loadConfig, DEFAULTS } from "./config.ts";
 import { makeClient, EsError } from "./es.ts";
 import { parseSize, type QuerySpec, type SortKey, type TypeFilter } from "./query.ts";
-import { find, count, totalSize, du, byExtension, dupes, doctor } from "./core.ts";
-import { renderFind, renderDu, renderExt, renderDupes, renderDoctor, renderLinkPlan, renderApply, humanSize, summaryLine } from "./render.ts";
+import { find, count, totalSize, du, duTree, byExtension, dupes, doctor } from "./core.ts";
+import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, humanSize, summaryLine } from "./render.ts";
 import { planLinks, applyLinks, undoLinks, type Journal } from "./link.ts";
 import { makeFsDeps } from "./fsdeps.ts";
 import { writeFileSync, readFileSync } from "node:fs";
@@ -19,7 +19,7 @@ COMMANDS
   find [query...]     search the index (default command)
   count [query...]    number of matches only
   size [query...]     total bytes of matches only
-  du <path>           immediate children by size, largest first
+  du <path>           children by size, largest first (--depth to recurse)
   big <path>          largest files anywhere under a path
   ext <path>          size and count grouped by file extension
   dupes [query...]    same-name same-size candidates, most reclaimable first
@@ -49,6 +49,7 @@ OUTPUT OPTIONS
   --sort <key>        size|name|path|modified|created|extension
   --asc               sort ascending (default is descending for size and dates)
   --date              show modified dates in find output
+  --depth <n>         levels for du to expand (default 1)
   --cap <n>           rows to aggregate over for ext, dupes and link (default 50000)
   --json              emit the whole result as JSON
   -q                  suppress the trailing summary line
@@ -65,7 +66,7 @@ CONFIG
 
 EXAMPLES
   ev find --ext mkv --larger 5G --under F:\\
-  ev du F:\\
+  ev du F:\\ --depth 3
   ev ext F:\\SteamLibrary
   ev dupes --under F:\\ --larger 1G
   ev big D:\\Downloads -n 20
@@ -85,7 +86,7 @@ interface Flags {
 
 const STR_FLAGS = new Set([
   "--ext", "--under", "--parent", "--larger", "--smaller", "--after", "--before",
-  "-n", "--offset", "--sort", "--cap", "--journal", "--undo",
+  "-n", "--offset", "--sort", "--cap", "--journal", "--undo", "--depth",
 ]);
 const BOOL_FLAGS = new Set([
   "--files", "--folders", "--regex", "--case", "--whole-word", "--match-path",
@@ -216,6 +217,12 @@ async function main(argv: string[]): Promise<number> {
 
     if (cmd === "du") {
       const limit = intFlag(f, "-n", 40);
+      const depth = intFlag(f, "--depth", 1);
+      if (depth > 1) {
+        const t = await duTree(es, path, depth, Math.min(limit, 12));
+        out(json ? JSON.stringify(t, null, 2) : renderDuTree(t));
+        return 0;
+      }
       const r = await du(es, path, limit);
       out(json ? JSON.stringify(r, null, 2) : renderDu(r));
       return 0;

@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { makeClient, type Runner } from "../src/es.ts";
 import { buildArgs, buildCountArgs, buildSearchTokens, parseSize } from "../src/query.ts";
-import { find, du, byExtension, dupes, doctor } from "../src/core.ts";
+import { find, du, duTree, byExtension, dupes, doctor } from "../src/core.ts";
 import { humanSize } from "../src/render.ts";
 
 /** A fake es.exe. Records argv, replays canned stdout — no mocking library. */
@@ -106,6 +106,65 @@ describe("es client", () => {
     const { run } = fakeEs([{ stdout: "Error: something" }]);
     const es = makeClient("es.exe", "1.5a", run);
     await expect(es.rows([])).rejects.toThrow(/not JSON/);
+  });
+});
+
+describe("instance fallback", () => {
+  // Everything registers under a version-shaped instance name. An upgrade
+  // changes it, and every command would otherwise die with a bare Error 8.
+  test("falls back to another instance name when the configured one is dead", async () => {
+    const calls: string[][] = [];
+    const run = async (_exe: string, args: string[]) => {
+      calls.push(args);
+      const named = args[0] === "-instance" ? args[1] : "";
+      if (named === "1.6") return { ok: true, stdout: "42", stderr: "", code: 0 };
+      return { ok: false, stdout: "", stderr: "", code: 8 };
+    };
+    const es = makeClient("es.exe", "1.6", run);
+    expect(await es.count(["x"])).toBe(42);
+    expect(es.resolvedInstance()).toBe("1.6");
+  });
+
+  test("a dead configured instance resolves to a working one and sticks", async () => {
+    const run = async (_exe: string, args: string[]) => {
+      const named = args[0] === "-instance" ? args[1] : "";
+      if (named === "1.5a") return { ok: true, stdout: "7", stderr: "", code: 0 };
+      return { ok: false, stdout: "", stderr: "", code: 8 };
+    };
+    const es = makeClient("es.exe", "9.9-bogus", run);
+    expect(await es.count(["x"])).toBe(7);
+    expect(es.resolvedInstance()).toBe("1.5a");
+    // Second call must not re-probe; it goes straight to the resolved name.
+    expect(await es.count(["y"])).toBe(7);
+  });
+
+  test("when nothing answers, the Error 8 guidance is still what surfaces", async () => {
+    const run = async () => ({ ok: false, stdout: "", stderr: "", code: 8 });
+    const es = makeClient("es.exe", "1.5a", run);
+    await expect(es.count(["x"])).rejects.toThrow(/Everything IPC not found/);
+  });
+});
+
+describe("duTree", () => {
+  test("expands only branches worth expanding, and tags depth", async () => {
+    const responses: Record<string, string> = {
+      "F:\\": JSON.stringify([{ filename: "F:\\big\\", size: 900 }, { filename: "F:\\tiny\\", size: 5 }]),
+      "F:\\big\\": JSON.stringify([{ filename: "F:\\big\\inner\\", size: 800 }]),
+    };
+    const run = async (_exe: string, args: string[]) => {
+      const pi = args.indexOf("-parent");
+      const parent = pi >= 0 ? args[pi + 1]! : "";
+      const folders = args.includes("/ad");
+      return { ok: true, stdout: folders ? (responses[parent] ?? "[]") : "[]", stderr: "", code: 0 };
+    };
+    const es = makeClient("es.exe", "1.5a", run);
+    const t = await duTree(es, "F:\\", 2, 12, 0.02);
+    expect(t.entries[0]!.name).toBe("big");
+    expect(t.entries[0]!.depth).toBe(0);
+    expect(t.entries[0]!.children?.[0]?.name).toBe("inner");
+    expect(t.entries[0]!.children?.[0]?.depth).toBe(1);
+    // "tiny" holds well under 2% of the level, so it is not expanded.
+    expect(t.entries[1]!.children).toBeUndefined();
   });
 });
 
