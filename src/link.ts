@@ -250,12 +250,17 @@ export async function applyLinks(plan: LinkPlan, deps: LinkDeps): Promise<ApplyR
         entries.push({ keeper: g.keeper, linked: target, size: g.size, hash: g.hash });
         reclaimed += g.size;
       } catch (err) {
+        let stray = false;
         try {
           await deps.unlink(tmp);
         } catch {
-          // The temp link may never have been created; nothing to clean up.
+          // The temp link either never existed or cannot be removed. A locked or
+          // read-only target fails BOTH the rename and the cleanup, so say which
+          // path was left behind rather than swallowing it.
+          stray = true;
         }
-        failures.push({ path: target, error: err instanceof Error ? err.message : String(err) });
+        const base = err instanceof Error ? err.message : String(err);
+        failures.push({ path: target, error: stray ? `${base} (left behind: ${tmp})` : base });
       }
     }
   }

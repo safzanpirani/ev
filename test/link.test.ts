@@ -202,6 +202,25 @@ describe("applyLinks", () => {
     expect(fs["F:\\b\\m.onnx"]!.ino).toBe("2");
     expect(fs["F:\\b\\m.onnx.evlink-tmp"]).toBeUndefined();
   });
+
+  // A read-only or locked target fails the rename AND the cleanup, which
+  // silently leaked a temp hard link on the first real run against main.
+  test("a temp that cannot be cleaned up is named in the failure, not swallowed", async () => {
+    const { deps } = fakeFs({
+      "F:\\a\\m.onnx": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "F:\\b\\m.onnx": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const plan = await planLinks([group(["F:\\a\\m.onnx", "F:\\b\\m.onnx"], 10 * MB)], deps);
+    deps.rename = async () => {
+      throw new Error("EPERM: operation not permitted");
+    };
+    deps.unlink = async () => {
+      throw new Error("EPERM: operation not permitted");
+    };
+    const r = await applyLinks(plan, deps);
+    expect(r.linked).toBe(0);
+    expect(r.failures[0]!.error).toContain("left behind: F:\\b\\m.onnx.evlink-tmp");
+  });
 });
 
 describe("undoLinks", () => {
