@@ -41,14 +41,55 @@ machine-PATH edit does not reach SSH sessions until main reboots.
 Requires voidtools' `es.exe` on main (defaults to `C:\Tools\es\es.exe`) and
 Everything running.
 
+## Reclaiming space with hard links
+
+`ev link` replaces verified duplicates with hard links. It is a dry run unless
+you pass `--yes`.
+
+```
+$ ev link --ext onnx --larger 100M
+    548M  4 links @ 137M
+          keep  F:\anewbeginning\Rope-Pearl\models\w600k_r50.onnx
+          link  F:\textgen\Deep-Live-Cam-cuda\tmp\.insightface\models\buffalo_l\w600k_r50.onnx
+          ...
+-- 7 groups, 2.16G reclaimable, 3.44G hashed.
+-- skipped: 62 cross-volume
+-- DRY RUN. Nothing changed. Re-run with --yes to apply.
+```
+
+What it guarantees:
+
+- **Content is hashed before anything is replaced.** Everything's index matches
+  on name and size, which is not grounds for touching a file. Two files with the
+  same name and size but different bytes are left alone.
+- **Hard links cannot cross volumes**, so each group is partitioned by volume
+  and cross-volume copies are reported, never silently dropped.
+- **Replacement is atomic.** Each duplicate is linked to a temporary name and
+  then renamed over the original, so an interruption leaves either the original
+  or the link — never a missing file.
+- **Every apply writes an undo journal.** `ev link --undo <journal> --yes`
+  copies the keeper back over each link and restores independent files.
+- **Re-running plans nothing.** Files already sharing an inode are reported as
+  already-linked.
+
+What it refuses to link, because a hard link is only safe when tools *replace* a
+file rather than *modify it in place*: databases, VM disks, logs, lock files,
+Windows system directories, and `.git` internals.
+
+The tradeoff to understand: deduplication removes redundancy. After linking, one
+bad sector takes out every path that shared those bytes rather than one copy.
+Weigh that on removable enclosures.
+
 ## Architecture
 
 ```
 cli.ts      parse, call, render, exit
-core.ts     actions — never prints
+core.ts     search and aggregation actions — never prints
+link.ts     plan / apply / undo for hard-link dedupe
 query.ts    pure: ergonomic flags in, es.exe argv out
 render.ts   pure: data in, string out
 es.ts       the one file that owns es.exe
+fsdeps.ts   the one file that owns the filesystem
 config.ts   optional; defaults are correct on main
 ```
 

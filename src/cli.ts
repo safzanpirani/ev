@@ -5,7 +5,10 @@ import { loadConfig, DEFAULTS } from "./config.ts";
 import { makeClient, EsError } from "./es.ts";
 import { parseSize, type QuerySpec, type SortKey, type TypeFilter } from "./query.ts";
 import { find, count, totalSize, du, byExtension, dupes, doctor } from "./core.ts";
-import { renderFind, renderDu, renderExt, renderDupes, renderDoctor, humanSize, summaryLine } from "./render.ts";
+import { renderFind, renderDu, renderExt, renderDupes, renderDoctor, renderLinkPlan, renderApply, humanSize, summaryLine } from "./render.ts";
+import { planLinks, applyLinks, undoLinks, type Journal } from "./link.ts";
+import { makeFsDeps } from "./fsdeps.ts";
+import { writeFileSync, readFileSync } from "node:fs";
 
 const HELP = `ev — file search over Everything's index
 
@@ -20,6 +23,7 @@ COMMANDS
   big <path>          largest files anywhere under a path
   ext <path>          size and count grouped by file extension
   dupes [query...]    same-name same-size candidates, most reclaimable first
+  link [query...]     replace verified duplicates with hard links (dry run)
   recent [query...]   most recently modified matches
   raw <args...>       pass arguments straight through to es.exe
   doctor              check that Everything is reachable
@@ -45,9 +49,15 @@ OUTPUT OPTIONS
   --sort <key>        size|name|path|modified|created|extension
   --asc               sort ascending (default is descending for size and dates)
   --date              show modified dates in find output
-  --cap <n>           rows to aggregate over for ext and dupes (default 50000)
+  --cap <n>           rows to aggregate over for ext, dupes and link (default 50000)
   --json              emit the whole result as JSON
   -q                  suppress the trailing summary line
+
+LINK OPTIONS
+  --yes               actually create the links (without it, nothing changes)
+  --quick             hash a 1MB head and tail instead of the whole file
+  --journal <path>    where to write the undo journal
+  --undo <path>       restore independent copies from a journal (needs --yes)
 
 CONFIG
   Defaults need no config file. Override with $EV_ES_PATH, $EV_INSTANCE,
@@ -61,6 +71,10 @@ EXAMPLES
   ev big D:\\Downloads -n 20
   ev count "ext:iso"
   ev raw -parent "F:\\" /ad -size -sort size-descending
+
+  ev link --ext safetensors,onnx --larger 100M          # plan, change nothing
+  ev link --ext safetensors,onnx --larger 100M --yes    # apply
+  ev link --undo C:\\Tools\\ev-journal-....json --yes   # put the copies back
 `;
 
 interface Flags {
@@ -71,11 +85,11 @@ interface Flags {
 
 const STR_FLAGS = new Set([
   "--ext", "--under", "--parent", "--larger", "--smaller", "--after", "--before",
-  "-n", "--offset", "--sort", "--cap",
+  "-n", "--offset", "--sort", "--cap", "--journal", "--undo",
 ]);
 const BOOL_FLAGS = new Set([
   "--files", "--folders", "--regex", "--case", "--whole-word", "--match-path",
-  "--asc", "--date", "--json", "-q", "-h", "--help",
+  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick",
 ]);
 
 function parseFlags(argv: string[]): Flags {
@@ -169,7 +183,7 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  const KNOWN = new Set(["find", "count", "size", "du", "big", "ext", "dupes", "recent", "raw", "doctor"]);
+  const KNOWN = new Set(["find", "count", "size", "du", "big", "ext", "dupes", "recent", "raw", "doctor", "link"]);
   const cmd = KNOWN.has(argv[0]!) ? argv[0]! : "find";
   const rest = KNOWN.has(argv[0]!) ? argv.slice(1) : argv;
 
@@ -220,6 +234,42 @@ async function main(argv: string[]): Promise<number> {
     const r = await find(es, spec);
     out(json ? JSON.stringify(r, null, 2) : quiet ? renderFind(r).split("\n").slice(0, -1).join("\n") : renderFind(r));
     return 0;
+  }
+
+  if (cmd === "link") {
+    const apply = f.bool.has("--yes");
+    const fsDeps = makeFsDeps({ quick: f.bool.has("--quick") });
+
+    const undoPath = f.str.get("--undo");
+    if (undoPath) {
+      const journal = JSON.parse(readFileSync(undoPath, "utf8")) as Journal;
+      if (!apply) {
+        const msg = `-- would restore ${journal.entries.length} file(s) from ${undoPath}. Re-run with --yes to apply.`;
+        out(json ? JSON.stringify({ wouldRestore: journal.entries.length, journal: undoPath }) : msg);
+        return 0;
+      }
+      const r = await undoLinks(journal, fsDeps);
+      out(json ? JSON.stringify(r, null, 2) : `-- restored ${r.restored} file(s), ${r.failures.length} failure(s).`);
+      return r.failures.length ? 1 : 0;
+    }
+
+    const limit = intFlag(f, "-n", 20);
+    const cap = intFlag(f, "--cap", 50_000);
+    const minSize = f.str.get("--larger") ? parseSize(f.str.get("--larger")!) : 1024 * 1024;
+    const spec = buildSpec(f, f.positional, cap);
+    const candidates = await dupes(es, spec, cap);
+    const plan = await planLinks(candidates.groups, fsDeps, { minSize });
+
+    if (!apply) {
+      out(json ? JSON.stringify(plan, null, 2) : renderLinkPlan(plan, limit, false));
+      return 0;
+    }
+    const result = await applyLinks(plan, fsDeps);
+    const journalPath =
+      f.str.get("--journal") ?? `ev-journal-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    writeFileSync(journalPath, JSON.stringify(result.journal, null, 2));
+    out(json ? JSON.stringify({ ...result, journalPath }, null, 2) : renderApply(result, journalPath));
+    return result.failures.length ? 1 : 0;
   }
 
   if (cmd === "dupes") {

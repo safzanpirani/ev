@@ -90,3 +90,41 @@ export function renderDoctor(d: DoctorReport): string {
     `  indexed:  ${(d.indexedFiles ?? 0).toLocaleString()} items`,
   ].join("\n");
 }
+
+export function renderLinkPlan(
+  plan: import("./link.ts").LinkPlan,
+  limit: number,
+  applied: boolean,
+): string {
+  const lines: string[] = [];
+  for (const g of plan.groups.slice(0, limit)) {
+    lines.push(`${pad(humanSize(g.reclaim), 8)}  ${g.replace.length} link${g.replace.length === 1 ? "" : "s"} @ ${humanSize(g.size)}`);
+    lines.push(`          keep  ${g.keeper}`);
+    for (const p of g.replace) lines.push(`          link  ${p}`);
+  }
+  if (plan.groups.length > limit) lines.push(`          ... ${plan.groups.length - limit} more groups`);
+
+  const counts = new Map<string, number>();
+  for (const s of plan.skipped) counts.set(s.reason, (counts.get(s.reason) ?? 0) + 1);
+  const skipSummary = [...counts.entries()].map(([r, n]) => `${n} ${r}`).join(", ");
+
+  lines.push(
+    `-- ${plan.groups.length} group${plan.groups.length === 1 ? "" : "s"}, ${humanSize(plan.reclaim)} reclaimable, ${humanSize(plan.hashedBytes)} hashed.`,
+  );
+  if (skipSummary) lines.push(`-- skipped: ${skipSummary}`);
+  if (!applied) lines.push(`-- DRY RUN. Nothing changed. Re-run with --yes to apply.`);
+  return lines.join("\n");
+}
+
+export function renderApply(r: import("./link.ts").ApplyResult, journalPath: string): string {
+  const lines = [
+    `-- linked ${r.linked} file${r.linked === 1 ? "" : "s"}, reclaimed ${humanSize(r.reclaimed)}.`,
+    `-- journal: ${journalPath}`,
+    `-- undo with: ev link --undo "${journalPath}" --yes`,
+  ];
+  if (r.failures.length) {
+    lines.unshift(...r.failures.map((f) => `FAILED  ${f.path}: ${f.error}`));
+    lines.push(`-- ${r.failures.length} failure${r.failures.length === 1 ? "" : "s"}; those files were left untouched.`);
+  }
+  return lines.join("\n");
+}
