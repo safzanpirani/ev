@@ -7,7 +7,7 @@ export interface FindResult {
   rows: EsRow[];
   total: number;
   shown: number;
-  totalSize: number;
+  totalSize: number | null;
   truncated: boolean;
 }
 
@@ -26,7 +26,7 @@ export function count(es: EsClient, spec: QuerySpec): Promise<number> {
   return es.count(buildCountArgs(spec));
 }
 
-export function totalSize(es: EsClient, spec: QuerySpec): Promise<number> {
+export function totalSize(es: EsClient, spec: QuerySpec): Promise<number | null> {
   return es.totalSize(buildCountArgs(spec));
 }
 
@@ -70,9 +70,13 @@ function leafName(p: string): string {
  */
 export async function du(es: EsClient, root: string, limit = 40): Promise<DuResult> {
   const base: QuerySpec = { terms: [], parent: root, sort: "size", limit };
-  const [folders, files] = await Promise.all([
+  const [folders, files, grandTotal, fileTotal] = await Promise.all([
     es.rows(buildArgs({ ...base, type: "folders" }, ["-size"])),
     es.rows(buildArgs({ ...base, type: "files" }, ["-size"])),
+    // ES returns an unknown-size sentinel when a total includes folders.
+    // Sum indexed files under the root instead, independently of display caps.
+    es.totalSize(buildCountArgs({ terms: [], under: root, type: "files" })),
+    es.totalSize(buildCountArgs({ terms: [], parent: root, type: "files" })),
   ]);
 
   const entries: DuEntry[] = [
@@ -80,9 +84,9 @@ export async function du(es: EsClient, root: string, limit = 40): Promise<DuResu
     ...files.map((r): DuEntry => ({ path: r.filename, name: leafName(r.filename), size: r.size ?? 0, kind: "file" })),
   ].sort((a, b) => b.size - a.size);
 
-  const folderTotal = folders.reduce((s, r) => s + (r.size ?? 0), 0);
-  const fileTotal = files.reduce((s, r) => s + (r.size ?? 0), 0);
-  return { root, entries: entries.slice(0, limit), folderTotal, fileTotal, grandTotal: folderTotal + fileTotal };
+  if (grandTotal === null || fileTotal === null) throw new Error("Everything did not report indexed file sizes for this directory");
+  const folderTotal = grandTotal - fileTotal;
+  return { root, entries: entries.slice(0, limit), folderTotal, fileTotal, grandTotal };
 }
 
 export interface ExtEntry {
@@ -135,8 +139,11 @@ export async function dupes(
   es: EsClient,
   spec: QuerySpec,
   cap = 50_000,
-): Promise<{ groups: DupeGroup[]; scanned: number; wastedTotal: number }> {
-  const rows = await es.rows(buildArgs({ ...spec, type: "files", sort: "size", limit: cap }, ["-size"]));
+): Promise<{ groups: DupeGroup[]; scanned: number; total: number; sampled: boolean; wastedTotal: number }> {
+  const [rows, total] = await Promise.all([
+    es.rows(buildArgs({ ...spec, type: "files", sort: "size", limit: cap }, ["-size"])),
+    es.count(buildCountArgs({ ...spec, type: "files" })),
+  ]);
 
   const acc = new Map<string, { name: string; size: number; paths: string[] }>();
   for (const r of rows) {
@@ -155,7 +162,7 @@ export async function dupes(
     groups.push({ name: g.name, size: g.size, paths: g.paths, wasted: g.size * (g.paths.length - 1) });
   }
   groups.sort((a, b) => b.wasted - a.wasted);
-  return { groups, scanned: rows.length, wastedTotal: groups.reduce((s, g) => s + g.wasted, 0) };
+  return { groups, scanned: rows.length, total, sampled: total > rows.length, wastedTotal: groups.reduce((s, g) => s + g.wasted, 0) };
 }
 
 export interface DoctorReport {
@@ -199,20 +206,19 @@ export async function duTree(
   perLevel = 12,
   minShare = 0.02,
 ): Promise<DuTreeResult> {
-  async function level(path: string, remaining: number, d: number): Promise<DuEntryTree[]> {
+  async function level(path: string, remaining: number, d: number): Promise<{ entries: DuEntryTree[]; grandTotal: number }> {
     const r = await du(es, path, perLevel);
     const out: DuEntryTree[] = [];
     for (const e of r.entries) {
       const node: DuEntryTree = { ...e, depth: d };
       if (remaining > 1 && e.kind === "folder" && e.size >= r.grandTotal * minShare) {
-        node.children = await level(e.path, remaining - 1, d + 1);
+        node.children = (await level(e.path, remaining - 1, d + 1)).entries;
       }
       out.push(node);
     }
-    return out;
+    return { entries: out, grandTotal: r.grandTotal };
   }
 
-  const entries = await level(root, depth, 0);
-  const grandTotal = entries.reduce((sum, e) => sum + e.size, 0);
+  const { entries, grandTotal } = await level(root, depth, 0);
   return { root, entries, grandTotal, depth };
 }

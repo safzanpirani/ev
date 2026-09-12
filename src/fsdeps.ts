@@ -1,6 +1,6 @@
 // The one file that owns the filesystem side of `ev link`.
 
-import { promises as fs } from "node:fs";
+import { promises as fs, constants } from "node:fs";
 import type { LinkDeps, FileFacts } from "./link.ts";
 
 /** Streamed so a 30 GB model weight does not land in memory. */
@@ -34,7 +34,8 @@ export function makeFsDeps(opts: { quick?: boolean } = {}): LinkDeps {
   return {
     async facts(path: string): Promise<FileFacts | null> {
       try {
-        const s = await fs.lstat(path);
+        const s = await fs.lstat(path, { bigint: true });
+        if (!s.isFile() && !s.isSymbolicLink()) return null;
         return {
           // ino exceeds 2^53 on NTFS, so it is carried as a string.
           ino: String(s.ino),
@@ -42,6 +43,7 @@ export function makeFsDeps(opts: { quick?: boolean } = {}): LinkDeps {
           nlink: Number(s.nlink),
           size: Number(s.size),
           isSymlink: s.isSymbolicLink(),
+          modified: String(s.mtimeNs),
         };
       } catch {
         return null;
@@ -55,7 +57,7 @@ export function makeFsDeps(opts: { quick?: boolean } = {}): LinkDeps {
     link: (existing, newPath) => fs.link(existing, newPath),
     rename: (from, to) => fs.rename(from, to),
     unlink: (path) => fs.unlink(path),
-    copy: (from, to) => fs.copyFile(from, to),
+    copy: (from, to) => fs.copyFile(from, to, constants.COPYFILE_EXCL),
     // On Windows, chmod only toggles the read-only bit, which is exactly what
     // a rename over a ReadOnly target needs cleared.
     makeWritable: (path) => fs.chmod(path, 0o666),

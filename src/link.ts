@@ -14,6 +14,7 @@ export interface FileFacts {
   nlink: number;
   size: number;
   isSymlink: boolean;
+  modified?: string;
 }
 
 export interface LinkDeps {
@@ -86,7 +87,7 @@ const DENIED_NAMES = ["pagefile.sys", "hiberfil.sys", "swapfile.sys", "ntuser.da
 
 /** Pure. Exported so the policy is testable without touching a disk. */
 export function isLinkable(path: string): boolean {
-  const p = path.toLowerCase();
+  const p = path.replaceAll("/", "\\").toLowerCase();
   if (DENIED_DIRS.some((d) => p.includes(d))) return false;
   const slash = p.lastIndexOf("\\");
   const name = slash >= 0 ? p.slice(slash + 1) : p;
@@ -238,16 +239,44 @@ export interface ApplyResult {
  * atomic, so an interruption leaves either the original or the link in place —
  * never a missing file. Each success is journalled so `undoLinks` can reverse it.
  */
-export async function applyLinks(plan: LinkPlan, deps: LinkDeps): Promise<ApplyResult> {
+function sameFile(a: FileFacts | null, b: FileFacts | null): boolean {
+  return !!a && !!b && !a.isSymlink && !b.isSymlink && a.ino === b.ino && a.dev === b.dev && a.size === b.size && a.modified === b.modified;
+}
+
+export async function applyLinks(
+  plan: LinkPlan,
+  deps: LinkDeps,
+  saveJournal?: (journal: Journal) => Promise<void> | void,
+): Promise<ApplyResult> {
   const entries: JournalEntry[] = [];
   const failures: Array<{ path: string; error: string }> = [];
   let reclaimed = 0;
+  const created = (deps.now ?? (() => new Date().toISOString()))();
 
   for (const g of plan.groups) {
     for (const target of g.replace) {
-      const tmp = `${target}.evlink-tmp`;
+      const tmp = `${target}.evlink-tmp-${crypto.randomUUID()}`;
+      let ownsTemporary = false;
       try {
+        const keeperFacts = await deps.facts(g.keeper);
+        const targetFacts = await deps.facts(target);
+        if (!isLinkable(g.keeper) || !isLinkable(target) || !keeperFacts || !targetFacts ||
+            keeperFacts.isSymlink || targetFacts.isSymlink || keeperFacts.dev !== targetFacts.dev ||
+            keeperFacts.size !== g.size || targetFacts.size !== g.size) throw new Error("files no longer match the link plan");
+        if (keeperFacts.ino === targetFacts.ino) continue;
+        if (await deps.hash(g.keeper) !== g.hash || await deps.hash(target) !== g.hash ||
+            !sameFile(keeperFacts, await deps.facts(g.keeper)) || !sameFile(targetFacts, await deps.facts(target))) {
+          throw new Error("file changed since planning; original preserved");
+        }
         await deps.link(g.keeper, tmp);
+        ownsTemporary = true;
+        const entry = { keeper: g.keeper, linked: target, size: g.size, hash: g.hash };
+        // Persist the intended replacement before it can happen. If interrupted,
+        // undo verifies the actual hard link before touching this path.
+        await saveJournal?.({ version: 1, created, entries: [...entries, entry] });
+        if (!sameFile(targetFacts, await deps.facts(target)) || !sameFile(keeperFacts, await deps.facts(tmp))) {
+          throw new Error("file changed before replacement; original preserved");
+        }
         try {
           await deps.rename(tmp, target);
         } catch (renameErr) {
@@ -256,15 +285,17 @@ export async function applyLinks(plan: LinkPlan, deps: LinkDeps): Promise<ApplyR
           // and retrying is safe. The resulting link shares the keeper's inode,
           // and therefore the keeper's attributes — there is nothing to restore.
           if (!deps.makeWritable) throw renameErr;
+          if (!sameFile(targetFacts, await deps.facts(target))) throw new Error("target changed before retry; original preserved");
           await deps.makeWritable(target);
           await deps.rename(tmp, target);
         }
-        entries.push({ keeper: g.keeper, linked: target, size: g.size, hash: g.hash });
+        ownsTemporary = false;
+        entries.push(entry);
         reclaimed += g.size;
       } catch (err) {
         let stray = false;
         try {
-          await deps.unlink(tmp);
+          if (ownsTemporary) await deps.unlink(tmp);
         } catch {
           // The temp link either never existed or cannot be removed. A locked or
           // read-only target fails BOTH the rename and the cleanup, so say which
@@ -278,7 +309,7 @@ export async function applyLinks(plan: LinkPlan, deps: LinkDeps): Promise<ApplyR
   }
 
   return {
-    journal: { version: 1, created: (deps.now ?? (() => new Date().toISOString()))(), entries },
+    journal: { version: 1, created, entries },
     linked: entries.length,
     reclaimed,
     failures,
@@ -297,15 +328,33 @@ export async function undoLinks(
   const failures: Array<{ path: string; error: string }> = [];
   let restored = 0;
 
+  if (journal?.version !== 1 || !Array.isArray(journal.entries) || journal.entries.some((e) =>
+    !e || typeof e.keeper !== "string" || typeof e.linked !== "string" || typeof e.hash !== "string" ||
+    !e.hash || !Number.isSafeInteger(e.size) || e.size < 0 || e.keeper === e.linked)) {
+    throw new Error("invalid ev undo journal");
+  }
+
   for (const e of journal.entries) {
-    const tmp = `${e.linked}.evunlink-tmp`;
+    const tmp = `${e.linked}.evunlink-tmp-${crypto.randomUUID()}`;
+    let ownsTemporary = false;
     try {
-      await deps.copy(e.keeper, tmp);
+      const keeperFacts = await deps.facts(e.keeper);
+      const targetFacts = await deps.facts(e.linked);
+      if (!isLinkable(e.keeper) || !isLinkable(e.linked) || !sameFile(keeperFacts, targetFacts) ||
+          targetFacts!.size !== e.size || await deps.hash(e.linked) !== e.hash) {
+        throw new Error("journal paths no longer share the recorded contents; file preserved");
+      }
+      await deps.copy(e.linked, tmp);
+      ownsTemporary = true;
+      if (await deps.hash(tmp) !== e.hash || !sameFile(targetFacts, await deps.facts(e.linked))) {
+        throw new Error("file changed during undo; file preserved");
+      }
       await deps.rename(tmp, e.linked);
+      ownsTemporary = false;
       restored++;
     } catch (err) {
       try {
-        await deps.unlink(tmp);
+        if (ownsTemporary) await deps.unlink(tmp);
       } catch {
         // Nothing to clean up.
       }

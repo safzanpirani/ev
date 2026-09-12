@@ -75,6 +75,10 @@ describe("query building", () => {
 });
 
 describe("es client", () => {
+  test("unknown indexed sizes are unavailable rather than an eighteen-exabyte total", async () => {
+    const { run } = fakeEs([{ stdout: "18446744073709551615" }]);
+    expect(await makeClient("es.exe", "1.5a", run).totalSize([])).toBeNull();
+  });
   test("errorlevel 8 explains the instance-name trap rather than echoing ENOENT", async () => {
     const { run } = fakeEs([{ stdout: "", code: 8 }]);
     const es = makeClient("es.exe", "1.5a", run);
@@ -110,6 +114,21 @@ describe("es client", () => {
 });
 
 describe("instance fallback", () => {
+  test("concurrent search rows and totals all recover from a dead instance", async () => {
+    const run: Runner = async (_exe, args) => {
+      if (args[1] !== "1.5a") return { ok: false, code: 8, stdout: "", stderr: "" };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { ok: true, code: 0, stderr: "", stdout: args.includes("-json")
+        ? JSON.stringify([{ filename: "F:\\fixture.txt", size: 25 }])
+        : args.includes("-get-total-size") ? "25" : "1" };
+    };
+    const es = makeClient("es.exe", "missing", run);
+    const result = await find(es, { terms: ["fixture"] });
+    expect(result.total).toBe(1);
+    expect(result.totalSize).toBe(25);
+    expect(result.rows[0]?.filename).toBe("F:\\fixture.txt");
+    expect(es.resolvedInstance()).toBe("1.5a");
+  });
   // Everything registers under a version-shaped instance name. An upgrade
   // changes it, and every command would otherwise die with a bare Error 8.
   test("falls back to another instance name when the configured one is dead", async () => {
@@ -152,6 +171,7 @@ describe("duTree", () => {
       "F:\\big\\": JSON.stringify([{ filename: "F:\\big\\inner\\", size: 800 }]),
     };
     const run = async (_exe: string, args: string[]) => {
+      if (args.includes("-get-total-size")) return { ok: true, stdout: args.includes("-path") ? "905" : "0", stderr: "", code: 0 };
       const pi = args.indexOf("-parent");
       const parent = pi >= 0 ? args[pi + 1]! : "";
       const folders = args.includes("/ad");
@@ -187,6 +207,8 @@ describe("find", () => {
 describe("du", () => {
   test("merges folders and loose files into one size-ordered listing", async () => {
     const { run } = fakeEs([
+      { match: /-get-total-size -path/, stdout: String(790513670924 + 14065568) },
+      { match: /-get-total-size -parent/, stdout: "14065568" },
       { match: /\/ad/, stdout: JSON.stringify([{ filename: "F:\\SteamLibrary\\", size: 790513670924 }]) },
       { match: /\/a-d/, stdout: JSON.stringify([{ filename: "F:\\big.zip", size: 14065568 }]) },
     ]);
@@ -200,12 +222,30 @@ describe("du", () => {
 
   test("strips the trailing backslash Everything puts on folder names", async () => {
     const { run } = fakeEs([
+      { match: /-get-total-size -path/, stdout: "1" },
+      { match: /-get-total-size -parent/, stdout: "0" },
       { match: /\/ad/, stdout: JSON.stringify([{ filename: "F:\\Games\\", size: 1 }]) },
       { match: /\/a-d/, stdout: "[]" },
     ]);
     const es = makeClient("es.exe", "1.5a", run);
     const r = await du(es, "F:\\");
     expect(r.entries[0]!.name).toBe("Games");
+  });
+
+  test("du and recursive du keep the complete total when the display is capped", async () => {
+    const { run } = fakeEs([
+      { match: /-get-total-size -path/, stdout: "1000" },
+      { match: /-get-total-size -parent/, stdout: "200" },
+      { match: /\/ad/, stdout: JSON.stringify([{ filename: "F:\\large\\", size: 500 }]) },
+      { match: /\/a-d/, stdout: JSON.stringify([{ filename: "F:\\loose.txt", size: 100 }]) },
+    ]);
+    const es = makeClient("es.exe", "1.5a", run);
+    const result = await du(es, "F:\\", 1);
+    expect(result.entries).toHaveLength(1);
+    expect(result.folderTotal).toBe(800);
+    expect(result.fileTotal).toBe(200);
+    expect(result.grandTotal).toBe(1000);
+    expect((await duTree(es, "F:\\", 2, 1)).grandTotal).toBe(1000);
   });
 });
 
@@ -233,6 +273,16 @@ describe("byExtension", () => {
 });
 
 describe("dupes", () => {
+  test("marks a capped candidate search as a sample", async () => {
+    const { run } = fakeEs([
+      { match: /-get-result-count/, stdout: "200" },
+      { match: /-json/, stdout: JSON.stringify([{ filename: "F:\\a.txt", size: 50 }]) },
+    ]);
+    const result = await dupes(makeClient("es.exe", "1.5a", run), { terms: [] }, 1);
+    expect(result.total).toBe(200);
+    expect(result.scanned).toBe(1);
+    expect(result.sampled).toBe(true);
+  });
   test("groups on name and size, and reports reclaimable bytes", async () => {
     const { run } = fakeEs([
       {

@@ -8,7 +8,8 @@ import { find, count, totalSize, du, duTree, byExtension, dupes, doctor } from "
 import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, humanSize, summaryLine } from "./render.ts";
 import { planLinks, applyLinks, undoLinks, type Journal } from "./link.ts";
 import { makeFsDeps } from "./fsdeps.ts";
-import { writeFileSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { createJournalWriter } from "./journal.ts";
 
 const HELP = `ev — file search over Everything's index
 
@@ -245,6 +246,7 @@ async function main(argv: string[]): Promise<number> {
 
   if (cmd === "link") {
     const apply = f.bool.has("--yes");
+    if (apply && f.bool.has("--quick")) throw new Error("--quick is only available for dry runs; omit it to verify full contents before --yes");
     const fsDeps = makeFsDeps({ quick: f.bool.has("--quick") });
 
     const undoPath = f.str.get("--undo");
@@ -271,10 +273,11 @@ async function main(argv: string[]): Promise<number> {
       out(json ? JSON.stringify(plan, null, 2) : renderLinkPlan(plan, limit, false));
       return 0;
     }
-    const result = await applyLinks(plan, fsDeps);
     const journalPath =
       f.str.get("--journal") ?? `ev-journal-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-    writeFileSync(journalPath, JSON.stringify(result.journal, null, 2));
+    const saveJournal = createJournalWriter(journalPath);
+    const result = await applyLinks(plan, fsDeps, saveJournal);
+    saveJournal(result.journal);
     out(json ? JSON.stringify({ ...result, journalPath }, null, 2) : renderApply(result, journalPath));
     return result.failures.length ? 1 : 0;
   }
@@ -298,7 +301,7 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "size") {
     const spec = buildSpec(f, f.positional, DEFAULTS.limit);
     const n = await totalSize(es, spec);
-    out(json ? JSON.stringify({ bytes: n, human: humanSize(n) }) : `${n}  (${humanSize(n)})`);
+    out(json ? JSON.stringify({ bytes: n, human: humanSize(n) }) : n === null ? "size unavailable from index" : `${n}  (${humanSize(n)})`);
     return 0;
   }
 

@@ -67,8 +67,14 @@ What it guarantees:
 - **Replacement is atomic.** Each duplicate is linked to a temporary name and
   then renamed over the original, so an interruption leaves either the original
   or the link — never a missing file.
-- **Every apply writes an undo journal.** `ev link --undo <journal> --yes`
-  copies the keeper back over each link and restores independent files.
+- **Apply reserves an undo journal before replacing files.** Each intended
+  replacement is flushed to the journal before its rename. Existing journals
+  are never overwritten. After an interruption, a journal may include a pending
+  entry; undo checks the actual file identity and contents before restoring it.
+- **Changed files are preserved.** Apply rechecks full hashes and file identities.
+  Undo refuses paths that no longer share the recorded contents and restores an
+  independent copy of each verified link. Stop writers before deduplicating:
+  these checks do not lock out concurrent applications.
 - **Re-running plans nothing.** Files already sharing an inode are reported as
   already-linked.
 - **ReadOnly targets are handled.** Windows refuses to rename over a read-only
@@ -100,8 +106,7 @@ Every action takes an injectable runner, so the tests drive a fake `es.exe` and
 assert on real values without a mocking library.
 
 `--quick` swaps the full hash for a 1 MB head+tail sample. It is much faster and
-it is a heuristic — a false match is not recoverable, because undo restores the
-keeper's bytes. Use it to explore, not to delete.
+it is a heuristic. It is available only for dry runs; `--quick --yes` is rejected.
 
 ## Two things that will bite you in `es.exe`
 
@@ -125,6 +130,9 @@ the same two terms as separate arguments matched 578.
   stderr so `ev find … > out.txt` stays clean. `-q` silences it.
 - **Totals are always true.** A capped listing still reports the real match count
   and total size, so a caller never mistakes the first 50 rows for the whole set.
+  `du` totals include all indexed files regardless of `-n` or depth. If Everything
+  reports an unknown size, search/size return `null` in JSON and an explicit
+  unavailable-size message in text instead of displaying the sentinel as bytes.
 - **`ext` and `dupes` aggregate over a bounded set** (`--cap`, default 50000) and
   say in their footer whether the answer was complete or sampled.
 - **`dupes` matches name and byte size, not content.** It returns candidates.

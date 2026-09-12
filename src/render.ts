@@ -3,8 +3,8 @@
 import type { EsRow } from "./es.ts";
 import type { DuResult, ExtEntry, DupeGroup, FindResult, DoctorReport } from "./core.ts";
 
-export function humanSize(bytes: number): string {
-  if (!Number.isFinite(bytes)) return "?";
+export function humanSize(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes)) return "?";
   const units = ["B", "K", "M", "G", "T", "P"];
   let n = Math.abs(bytes);
   let u = 0;
@@ -32,7 +32,8 @@ export function renderFind(r: FindResult, opts: { showDate?: boolean } = {}): st
 }
 
 export function summaryLine(r: FindResult): string {
-  const scale = `${r.total.toLocaleString()} match${r.total === 1 ? "" : "es"}, ${humanSize(r.totalSize)} total`;
+  const size = r.totalSize === null ? "size unavailable from index" : `${humanSize(r.totalSize)} total`;
+  const scale = `${r.total.toLocaleString()} match${r.total === 1 ? "" : "es"}, ${size}`;
   return r.truncated ? `-- ${scale}; showing ${r.shown}. Raise with -n, page with --offset.` : `-- ${scale}.`;
 }
 
@@ -76,7 +77,7 @@ export function renderExt(r: { entries: ExtEntry[]; scanned: number; total: numb
   return lines.join("\n");
 }
 
-export function renderDupes(r: { groups: DupeGroup[]; scanned: number; wastedTotal: number }, limit: number): string {
+export function renderDupes(r: { groups: DupeGroup[]; scanned: number; total: number; sampled: boolean; wastedTotal: number }, limit: number): string {
   const lines: string[] = [];
   for (const g of r.groups.slice(0, limit)) {
     lines.push(`${pad(humanSize(g.wasted), 8)}  ${g.paths.length}x ${humanSize(g.size)}  ${g.name}`);
@@ -86,6 +87,7 @@ export function renderDupes(r: { groups: DupeGroup[]; scanned: number; wastedTot
     `-- ${r.groups.length.toLocaleString()} candidate group${r.groups.length === 1 ? "" : "s"} across ${r.scanned.toLocaleString()} files, ${humanSize(r.wastedTotal)} reclaimable.`,
   );
   lines.push("-- Matched on name and byte size, not content. Hash before deleting.");
+  if (r.sampled) lines.push(`-- sampled the ${r.scanned.toLocaleString()} largest of ${r.total.toLocaleString()} files; smaller files are not counted. Raise with --cap.`);
   return lines.join("\n");
 }
 

@@ -55,7 +55,7 @@ export class EsError extends Error {
 export interface EsClient {
   rows(args: string[]): Promise<EsRow[]>;
   count(query: string[]): Promise<number>;
-  totalSize(query: string[]): Promise<number>;
+  totalSize(query: string[]): Promise<number | null>;
   raw(args: string[]): Promise<string>;
   version(): Promise<string>;
   /** The instance name that actually answered, after any fallback. */
@@ -75,7 +75,7 @@ const FALLBACK_INSTANCES = ["1.5a", "1.5", "1.4", "", "Everything"];
 export function makeClient(exe: string, instance: string, run: Runner = defaultRunner): EsClient {
   // Resolved once per process: the fast path never pays for the fallback.
   let resolved = instance;
-  let probed = false;
+  let fallback: Promise<void> | undefined;
 
   function argsFor(name: string, args: string[]): string[] {
     return name ? ["-instance", name, ...args] : args;
@@ -86,17 +86,21 @@ export function makeClient(exe: string, instance: string, run: Runner = defaultR
 
     // Error 8 means no Everything answered under that instance name. Try the
     // others once before reporting failure, and keep whichever one works.
-    if (!r.ok && r.code === 8 && !probed) {
-      probed = true;
-      for (const candidate of FALLBACK_INSTANCES) {
-        if (candidate === resolved) continue;
-        const attempt = await run(exe, argsFor(candidate, args));
-        if (attempt.ok) {
-          resolved = candidate;
-          r = attempt;
-          break;
+    if (!r.ok && r.code === 8) {
+      // find/du issue several requests together. Every caller must wait for
+      // the same discovery, then retry its own query on the resolved instance.
+      fallback ??= (async () => {
+        for (const candidate of FALLBACK_INSTANCES) {
+          if (candidate === resolved) continue;
+          const attempt = await run(exe, argsFor(candidate, ["-get-result-count"]));
+          if (attempt.ok || attempt.code === 9) {
+            resolved = candidate;
+            return;
+          }
         }
-      }
+      })();
+      await fallback;
+      r = await run(exe, argsFor(resolved, args));
     }
 
     if (!r.ok) {
@@ -130,8 +134,10 @@ export function makeClient(exe: string, instance: string, run: Runner = defaultR
     },
     async totalSize(query) {
       const out = await call(["-get-total-size", ...query]);
+      // ES uses UINT64_MAX when a result has no indexed size (often folders).
+      if (out.trim() === "18446744073709551615") return null;
       const n = Number(out.trim());
-      if (!Number.isFinite(n)) throw new EsError(0, `es -get-total-size returned ${JSON.stringify(out.trim())}`);
+      if (!Number.isSafeInteger(n) || n < 0) throw new EsError(0, `es -get-total-size returned ${JSON.stringify(out.trim())}`);
       return n;
     },
     raw: (args) => call(args),
