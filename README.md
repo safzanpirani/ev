@@ -41,6 +41,58 @@ machine-PATH edit does not reach SSH sessions until main reboots.
 Requires voidtools' `es.exe` on main (defaults to `C:\Tools\es\es.exe`) and
 Everything running.
 
+## macOS
+
+On the Mac, `ev` answers from [fsearch](https://github.com/noahdunnagan/fsearch)'s
+index instead of Everything. The backend follows the platform (`$EV_BACKEND=es|fsearch`
+overrides it), and the verbs, flags, row shape and `--json` shape stay the same.
+
+```bash
+cd ~/Development/vendor/fsearch && cargo build --release && ./target/release/fsearch install   # ~/.local/bin/fsearch
+cd ~/Development/ev && bun install && bun link                                                   # ~/.bun/bin/ev
+ev doctor
+```
+
+The first `ev` call starts the fsearch daemon. Its first run lists the whole disk
+(4.0M entries in 17 s here), then follows FSEvents. The index lives in
+`~/Library/Application Support/FSearch` (about 1.3 GB with the content index).
+
+**Full Disk Access.** Without it, the daemon skips Desktop, Documents, Downloads,
+iCloud Drive, `~/Library/Containers` and `/Volumes` rather than trigger privacy
+prompts. `ev doctor` lists what is missing. To fix it, grant Full Disk Access to the
+terminal app that starts the daemon (or run `fsearch install --login` and grant it to
+`~/.local/bin/fsearch`, again after each rebuild), then `pkill -f 'fsearch serve'`.
+The next call restarts it and rescans the skipped folders.
+
+| Verb | On macOS |
+|---|---|
+| `find`, `recent`, `big`, `count`, `size`, `ext`, `raw`, `doctor` | work |
+| `find --grep <text>`, `--grep-regex <re>` | content search, macOS only |
+| `du` | refuses: fsearch has no folder-size rollups. Use `sweep dust <dir>` |
+| `dupes` | refuses: APFS clones look like duplicates but share blocks |
+| `link` | shows saved plans and undoes; refuses to plan or apply |
+
+What differs from Everything:
+
+- **Query words are fsearch syntax.** They are fuzzy and typo-tolerant (`mian.rs`
+  finds `main.rs`), and accept `'exact`, `^prefix`, `suffix$`, `!exclude` and
+  fsearch filters. `find` without `--sort` keeps fsearch's relevance ranking.
+- **Totals are counted up to a cap.** fsearch has no count query, so `find` fetches
+  up to 10,000 matches (`count` and `size` use `--cap`, default 100,000). Past the
+  cap, the total is a floor (`totalExact: false` / `atLeast: true`) and the size is
+  unknown; `size` refuses rather than print part of a sum.
+- **Largest and newest are still exact.** `big`, `recent` and `--sort size|modified`
+  narrow a size or age threshold until the matches above it fit in one fetch.
+  `--sort name|path|extension` and `--asc` need every match and refuse past the cap.
+- **Unsupported flags fail by name:** `--case`, `--whole-word`, `--sort created`,
+  `--match-path` without `--regex`, and `--under` with `--parent`.
+- Folder rows carry no size. Dates are converted to ages, since fsearch filters by
+  age: `--after` takes `2026-01-01`, `2026-01-01T09:30`, `today`, `yesterday`, `7d`, `12h`.
+- Content search is smart-case and covers text files. Its index leaves out
+  `node_modules`, `Library`, `vendor`, build output and caches, so an unscoped
+  `--grep` misses them; scope it with `--under` into such a folder and fsearch
+  scans disk instead.
+
 ## Reclaiming space with hard links
 
 `ev link` replaces verified duplicates with hard links. It is a dry run unless
@@ -76,10 +128,25 @@ What it guarantees:
   independent copy of each verified link. Stop writers before deduplicating:
   these checks do not lock out concurrent applications.
 - **Re-running plans nothing.** Files already sharing an inode are reported as
-  already-linked.
+  already-linked, and each inode is hashed once, so an already-linked tree costs
+  no extra reads.
 - **ReadOnly targets are handled.** Windows refuses to rename over a read-only
   file. Since the bytes are already verified identical, the attribute is cleared
   and the rename retried.
+
+Mirrors between two trees take several `--under` roots. `--keep` names a tree
+whose files are never replaced; they become the keepers, so another application
+reading that tree sees the same inode, timestamps and bytes as before. Save the
+verified plan, review it, then apply exactly that plan:
+
+```
+$ ev link --under 'D:\Downloads\n' --under 'D:\Media' --keep 'D:\Downloads\n' --save-plan plan.json
+$ ev link --plan plan.json            # show it again
+$ ev link --plan plan.json --yes      # apply it; every file is re-verified first
+```
+
+Planning and applying print a progress line to stderr every few seconds, so a
+long run can go into a detached job and its log shows how far it got.
 
 What it refuses to link, because a hard link is only safe when tools *replace* a
 file rather than *modify it in place*: databases, VM disks, logs, lock files,
@@ -100,6 +167,11 @@ render.ts   pure: data in, string out
 es.ts       the one file that owns es.exe
 fsdeps.ts   the one file that owns the filesystem
 config.ts   optional; defaults are correct on main
+maccli.ts   macOS frontend: the same verbs, answered by fsearch
+mac.ts      macOS actions: find, count, size, ext, grep, doctor — never prints
+fsquery.ts  pure: QuerySpec in, fsearch query out; unsupported flags fail here
+fsearch.ts  the one file that owns fsearch (socket, daemon start, reply parsing)
+macrender.ts pure: macOS results in, string out
 ```
 
 Every action takes an injectable runner, so the tests drive a fake `es.exe` and
@@ -137,6 +209,13 @@ the same two terms as separate arguments matched 578.
   say in their footer whether the answer was complete or sampled.
 - **`dupes` matches name and byte size, not content.** It returns candidates.
   Hash before deleting.
+- **`dupes` folds existing hard links.** The index sees names, not inodes, so a
+  library built from hard links looks like a full copy. `dupes` stats each
+  candidate and counts paths that share an inode once, reporting that shared
+  space on its own footer line. `--index-only` skips the stat.
+- **An empty result set has zero bytes.** ES reports the unknown-size sentinel
+  for an empty set as well as for a genuinely unknown size. `du` over a folder
+  with no loose files, and `size` over no matches, report 0.
 - **Everything indexes names and metadata, never file contents.** Content search
   is ripgrep's job.
 

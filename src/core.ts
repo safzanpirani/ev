@@ -19,15 +19,28 @@ export async function find(es: EsClient, spec: QuerySpec): Promise<FindResult> {
     es.count(countArgs),
     es.totalSize(countArgs),
   ]);
-  return { rows, total, shown: rows.length, totalSize, truncated: total > rows.length };
+  // An empty result set has no size, so ES reports the unknown-size sentinel.
+  return { rows, total, shown: rows.length, totalSize: total === 0 ? 0 : totalSize, truncated: total > rows.length };
 }
 
 export function count(es: EsClient, spec: QuerySpec): Promise<number> {
   return es.count(buildCountArgs(spec));
 }
 
+/**
+ * ES answers -get-total-size with the unknown-size sentinel for an empty result
+ * set as well as for a genuinely unknown size. A folder with no loose files hit
+ * the first case, and `du` reported it as missing index data. Zero matches
+ * means zero bytes.
+ */
+async function indexedBytes(es: EsClient, query: string[]): Promise<number | null> {
+  const size = await es.totalSize(query);
+  if (size !== null) return size;
+  return (await es.count(query)) === 0 ? 0 : null;
+}
+
 export function totalSize(es: EsClient, spec: QuerySpec): Promise<number | null> {
-  return es.totalSize(buildCountArgs(spec));
+  return indexedBytes(es, buildCountArgs(spec));
 }
 
 export interface DuEntry {
@@ -75,8 +88,8 @@ export async function du(es: EsClient, root: string, limit = 40): Promise<DuResu
     es.rows(buildArgs({ ...base, type: "files" }, ["-size"])),
     // ES returns an unknown-size sentinel when a total includes folders.
     // Sum indexed files under the root instead, independently of display caps.
-    es.totalSize(buildCountArgs({ terms: [], under: root, type: "files" })),
-    es.totalSize(buildCountArgs({ terms: [], parent: root, type: "files" })),
+    indexedBytes(es, buildCountArgs({ terms: [], under: root, type: "files" })),
+    indexedBytes(es, buildCountArgs({ terms: [], parent: root, type: "files" })),
   ]);
 
   const entries: DuEntry[] = [
@@ -128,27 +141,57 @@ export interface DupeGroup {
   size: number;
   paths: string[];
   wasted: number;
+  /** Paths that already share an inode with another path in the group. */
+  linked?: number;
+}
+
+/**
+ * Returns a file identity (volume and file index), or null when the path
+ * cannot be read. Two paths with the same identity are one file on disk.
+ */
+export type Identify = (path: string) => Promise<string | null>;
+
+export interface DupesResult {
+  groups: DupeGroup[];
+  scanned: number;
+  total: number;
+  sampled: boolean;
+  wastedTotal: number;
+  /** Bytes the index double-counts because hard links already share them. Present when identities were checked. */
+  linkedTotal?: number;
 }
 
 /**
  * Same-name, same-size candidates. This is a candidate set, not proof: matching
  * name and byte count is strong evidence, not a content hash. A caller that
  * needs certainty must hash the paths this returns.
+ *
+ * `roots` scopes the search to several subtrees at once, which is what a mirror
+ * between two folders needs: `-path` takes one subtree, so each root is its own
+ * query and the rows are merged before grouping.
  */
 export async function dupes(
   es: EsClient,
   spec: QuerySpec,
   cap = 50_000,
-): Promise<{ groups: DupeGroup[]; scanned: number; total: number; sampled: boolean; wastedTotal: number }> {
-  const [rows, total] = await Promise.all([
-    es.rows(buildArgs({ ...spec, type: "files", sort: "size", limit: cap }, ["-size"])),
-    es.count(buildCountArgs({ ...spec, type: "files" })),
-  ]);
+  roots: string[] = [],
+  identify?: Identify,
+): Promise<DupesResult> {
+  const scopes: QuerySpec[] = roots.length ? roots.map((under) => ({ ...spec, under })) : [spec];
+  const parts = await Promise.all(scopes.map(async (s) => {
+    const [rows, total] = await Promise.all([
+      es.rows(buildArgs({ ...s, type: "files", sort: "size", limit: cap }, ["-size"])),
+      es.count(buildCountArgs({ ...s, type: "files" })),
+    ]);
+    return { rows, total, sampled: total > rows.length };
+  }));
 
+  const seen = new Set<string>();
   const acc = new Map<string, { name: string; size: number; paths: string[] }>();
-  for (const r of rows) {
+  for (const r of parts.flatMap((p) => p.rows)) {
     const size = r.size ?? 0;
-    if (size <= 0) continue;
+    if (size <= 0 || seen.has(r.filename.toLowerCase())) continue;
+    seen.add(r.filename.toLowerCase());
     const name = leafName(r.filename).toLowerCase();
     const key = `${name} ${size}`;
     const cur = acc.get(key) ?? { name: leafName(r.filename), size, paths: [] };
@@ -156,13 +199,38 @@ export async function dupes(
     acc.set(key, cur);
   }
 
+  const candidates = [...acc.values()].filter((g) => g.paths.length >= 2);
+
+  // Everything sees names, not inodes, so a hard-linked library looks like a
+  // full copy. Stat the candidates and count each file once.
+  const ids = new Map<string, string>();
+  if (identify) {
+    const paths = candidates.flatMap((g) => g.paths);
+    for (let i = 0; i < paths.length; i += 64) {
+      const batch = paths.slice(i, i + 64);
+      const got = await Promise.all(batch.map(identify));
+      batch.forEach((p, j) => ids.set(p, got[j] ?? `unreadable:${p}`));
+    }
+  }
+
   const groups: DupeGroup[] = [];
-  for (const g of acc.values()) {
-    if (g.paths.length < 2) continue;
-    groups.push({ name: g.name, size: g.size, paths: g.paths, wasted: g.size * (g.paths.length - 1) });
+  let linkedTotal = 0;
+  for (const g of candidates) {
+    const distinct = identify ? new Set(g.paths.map((p) => ids.get(p)!)).size : g.paths.length;
+    const linked = g.paths.length - distinct;
+    linkedTotal += g.size * linked;
+    if (distinct < 2) continue;
+    groups.push({ name: g.name, size: g.size, paths: g.paths, wasted: g.size * (distinct - 1), ...(identify ? { linked } : {}) });
   }
   groups.sort((a, b) => b.wasted - a.wasted);
-  return { groups, scanned: rows.length, total, sampled: total > rows.length, wastedTotal: groups.reduce((s, g) => s + g.wasted, 0) };
+  return {
+    ...(identify ? { linkedTotal } : {}),
+    groups,
+    scanned: parts.reduce((n, p) => n + p.rows.length, 0),
+    total: parts.reduce((n, p) => n + p.total, 0),
+    sampled: parts.some((p) => p.sampled),
+    wastedTotal: groups.reduce((s, g) => s + g.wasted, 0),
+  };
 }
 
 export interface DoctorReport {

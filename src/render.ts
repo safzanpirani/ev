@@ -1,7 +1,7 @@
 // Pure rendering: data in, string out. No IO, no colour decisions of its own.
 
 import type { EsRow } from "./es.ts";
-import type { DuResult, ExtEntry, DupeGroup, FindResult, DoctorReport } from "./core.ts";
+import type { DuResult, ExtEntry, FindResult, DoctorReport } from "./core.ts";
 
 export function humanSize(bytes: number | null): string {
   if (bytes === null || !Number.isFinite(bytes)) return "?";
@@ -77,15 +77,17 @@ export function renderExt(r: { entries: ExtEntry[]; scanned: number; total: numb
   return lines.join("\n");
 }
 
-export function renderDupes(r: { groups: DupeGroup[]; scanned: number; total: number; sampled: boolean; wastedTotal: number }, limit: number): string {
+export function renderDupes(r: import("./core.ts").DupesResult, limit: number): string {
   const lines: string[] = [];
   for (const g of r.groups.slice(0, limit)) {
-    lines.push(`${pad(humanSize(g.wasted), 8)}  ${g.paths.length}x ${humanSize(g.size)}  ${g.name}`);
+    const linked = g.linked ? ` (${g.linked} already hard-linked)` : "";
+    lines.push(`${pad(humanSize(g.wasted), 8)}  ${g.paths.length}x ${humanSize(g.size)}  ${g.name}${linked}`);
     for (const p of g.paths) lines.push(`              ${p}`);
   }
   lines.push(
     `-- ${r.groups.length.toLocaleString()} candidate group${r.groups.length === 1 ? "" : "s"} across ${r.scanned.toLocaleString()} files, ${humanSize(r.wastedTotal)} reclaimable.`,
   );
+  if (r.linkedTotal) lines.push(`-- ${humanSize(r.linkedTotal)} more matches paths already hard-linked together; that space is already shared.`);
   lines.push("-- Matched on name and byte size, not content. Hash before deleting.");
   if (r.sampled) lines.push(`-- sampled the ${r.scanned.toLocaleString()} largest of ${r.total.toLocaleString()} files; smaller files are not counted. Raise with --cap.`);
   return lines.join("\n");
@@ -114,6 +116,7 @@ export function renderLinkPlan(
   plan: import("./link.ts").LinkPlan,
   limit: number,
   applied: boolean,
+  applyHint = "Re-run with --yes to apply.",
 ): string {
   const lines: string[] = [];
   for (const g of plan.groups.slice(0, limit)) {
@@ -131,8 +134,15 @@ export function renderLinkPlan(
     `-- ${plan.groups.length} group${plan.groups.length === 1 ? "" : "s"}, ${humanSize(plan.reclaim)} reclaimable, ${humanSize(plan.hashedBytes)} hashed.`,
   );
   if (skipSummary) lines.push(`-- skipped: ${skipSummary}`);
-  if (!applied) lines.push(`-- DRY RUN. Nothing changed. Re-run with --yes to apply.`);
+  if (!applied) lines.push(`-- DRY RUN. Nothing changed. ${applyHint}`);
   return lines.join("\n");
+}
+
+/** One stderr line per progress event, for detached jobs whose log is the only view. */
+export function renderProgress(p: import("./link.ts").Progress): string {
+  const pct = p.totalBytes > 0 ? ` (${Math.floor((p.bytes / p.totalBytes) * 100)}%)` : "";
+  const verb = p.phase === "hash" ? "hashed" : "linking";
+  return `-- ${verb} ${p.done}/${p.total} files, ${humanSize(p.bytes)}/${humanSize(p.totalBytes)}${pct}  ${p.path}`;
 }
 
 export function renderApply(r: import("./link.ts").ApplyResult, journalPath: string): string {

@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { planLinks, applyLinks, undoLinks, isLinkable, type LinkDeps, type FileFacts, type Journal } from "../src/link.ts";
+import { planLinks, applyLinks, undoLinks, isLinkable, isKept, parsePlan, type LinkDeps, type FileFacts, type Journal, type Progress } from "../src/link.ts";
 import type { DupeGroup } from "../src/core.ts";
 
 /** An in-memory filesystem. Records every mutation so tests assert on real values. */
@@ -165,6 +165,92 @@ describe("planLinks", () => {
     });
     const plan = await planLinks([group(["F:\\s\\m.onnx", "F:\\long\\path\\m.onnx"], 10 * MB)], deps);
     expect(plan.groups[0]!.keeper).toBe("F:\\long\\path\\m.onnx");
+  });
+});
+
+describe("hashing cost", () => {
+  test("paths sharing an inode are read once, so a linked library costs no extra reads", async () => {
+    const { deps } = fakeFs({
+      "D:\\Downloads\\n\\a.mp4": { ino: "1", dev: 10, nlink: 2, size: 10 * MB, content: "same" },
+      "D:\\Media\\n\\a.mp4": { ino: "1", dev: 10, nlink: 2, size: 10 * MB, content: "same" },
+      "D:\\Old\\a.mp4": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const hashed: string[] = [];
+    const counting: LinkDeps = { ...deps, hash: (p) => (hashed.push(p), deps.hash(p)) };
+    const paths = ["D:\\Downloads\\n\\a.mp4", "D:\\Media\\n\\a.mp4", "D:\\Old\\a.mp4"];
+    const plan = await planLinks([group(paths, 10 * MB)], counting, { keep: ["D:\\Downloads\\n"] });
+    expect(hashed).toEqual(["D:\\Downloads\\n\\a.mp4", "D:\\Old\\a.mp4"]);
+    expect(plan.hashedBytes).toBe(20 * MB);
+    expect(plan.groups[0]!.keeper).toBe("D:\\Downloads\\n\\a.mp4");
+    expect(plan.groups[0]!.replace).toEqual(["D:\\Old\\a.mp4"]);
+    expect(plan.skipped).toContainEqual({ path: "D:\\Media\\n\\a.mp4", reason: "already-linked" });
+  });
+});
+
+describe("--keep", () => {
+  test("a kept file becomes the keeper even when another path is shorter", async () => {
+    const { deps } = fakeFs({
+      "D:\\M\\a.mp4": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "D:\\Downloads\\n\\Girls\\a.mp4": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const plan = await planLinks([group(["D:\\M\\a.mp4", "D:\\Downloads\\n\\Girls\\a.mp4"], 10 * MB)], deps, { keep: ["D:\\Downloads\\n"] });
+    expect(plan.groups[0]!.keeper).toBe("D:\\Downloads\\n\\Girls\\a.mp4");
+    expect(plan.groups[0]!.replace).toEqual(["D:\\M\\a.mp4"]);
+  });
+
+  test("a second kept copy is never replaced", async () => {
+    const { deps } = fakeFs({
+      "D:\\keep\\a\\x.mp4": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "D:\\keep\\b\\x.mp4": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+      "D:\\other\\x.mp4": { ino: "3", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const paths = ["D:\\keep\\a\\x.mp4", "D:\\keep\\b\\x.mp4", "D:\\other\\x.mp4"];
+    const plan = await planLinks([group(paths, 10 * MB)], deps, { keep: ["D:\\keep\\"] });
+    expect(plan.groups[0]!.keeper).toBe("D:\\keep\\a\\x.mp4");
+    expect(plan.groups[0]!.replace).toEqual(["D:\\other\\x.mp4"]);
+    expect(plan.skipped).toContainEqual({ path: "D:\\keep\\b\\x.mp4", reason: "kept" });
+  });
+
+  test("matches whole directory names, case-insensitively", () => {
+    expect(isKept("D:\\media\\a.mp4", ["D:\\Media"])).toBe(true);
+    expect(isKept("D:\\Media2\\a.mp4", ["D:\\Media"])).toBe(false);
+    expect(isKept("D:/Media/a.mp4", ["D:\\Media\\"])).toBe(true);
+  });
+});
+
+describe("progress", () => {
+  test("planning and applying report every file against a known total", async () => {
+    const { deps } = fakeFs({
+      "F:\\a\\m.onnx": { ino: "1", dev: 10, size: 10 * MB, content: "same" },
+      "F:\\b\\m.onnx": { ino: "2", dev: 10, size: 10 * MB, content: "same" },
+    });
+    const events: Progress[] = [];
+    const plan = await planLinks([group(["F:\\a\\m.onnx", "F:\\b\\m.onnx"], 10 * MB)], deps, { onProgress: (p) => events.push(p) });
+    await applyLinks(plan, deps, undefined, (p) => events.push(p));
+    expect(events.map((e) => `${e.phase} ${e.done}/${e.total} ${e.bytes}/${e.totalBytes}`)).toEqual([
+      `hash 1/2 ${10 * MB}/${20 * MB}`,
+      `hash 2/2 ${20 * MB}/${20 * MB}`,
+      `link 1/1 0/${10 * MB}`,
+    ]);
+  });
+});
+
+describe("parsePlan", () => {
+  const good = {
+    version: 1, created: "x", quick: false, skipped: [], hashedBytes: 20,
+    groups: [{ keeper: "D:\\a", replace: ["D:\\b"], size: 10, hash: "h", reclaim: 999 }],
+  };
+
+  test("recomputes reclaim from the groups rather than trusting the file", () => {
+    const plan = parsePlan(good);
+    expect(plan.groups[0]!.reclaim).toBe(10);
+    expect(plan.reclaim).toBe(10);
+  });
+
+  test("rejects anything that is not a saved plan", () => {
+    expect(() => parsePlan({ groups: [] })).toThrow(/--save-plan/);
+    expect(() => parsePlan({ ...good, groups: [{ ...good.groups[0], replace: ["D:\\a"] }] })).toThrow(/malformed/);
+    expect(() => parsePlan({ ...good, groups: [{ ...good.groups[0], size: -1 }] })).toThrow(/malformed/);
   });
 });
 

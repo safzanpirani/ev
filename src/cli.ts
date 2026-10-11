@@ -5,11 +5,12 @@ import { loadConfig, DEFAULTS } from "./config.ts";
 import { makeClient, EsError } from "./es.ts";
 import { parseSize, type QuerySpec, type SortKey, type TypeFilter } from "./query.ts";
 import { find, count, totalSize, du, duTree, byExtension, dupes, doctor } from "./core.ts";
-import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, humanSize, summaryLine } from "./render.ts";
-import { planLinks, applyLinks, undoLinks, type Journal } from "./link.ts";
+import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, renderProgress, humanSize, summaryLine } from "./render.ts";
+import { planLinks, applyLinks, undoLinks, parsePlan, type Journal, type LinkPlan, type Progress, type SavedPlan } from "./link.ts";
 import { makeFsDeps } from "./fsdeps.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createJournalWriter } from "./journal.ts";
+import { selectBackend, runFsearch, runFsearchRaw, LINK_ON_MAC, GREP_OFF_MAC } from "./maccli.ts";
 
 const HELP = `ev — file search over Everything's index
 
@@ -31,7 +32,8 @@ COMMANDS
 
 QUERY OPTIONS
   --ext a,b,c         restrict to extensions
-  --under <path>      restrict to a directory subtree
+  --under <path>      restrict to a directory subtree (dupes and link accept
+                      it more than once, to compare two trees)
   --parent <path>     restrict to immediate children of a directory
   --larger <size>     at least this big  (500, 10K, 1.5G, 2TB)
   --smaller <size>    at most this big
@@ -52,14 +54,30 @@ OUTPUT OPTIONS
   --date              show modified dates in find output
   --depth <n>         levels for du to expand (default 1)
   --cap <n>           rows to aggregate over for ext, dupes and link (default 50000)
+  --index-only        dupes: skip the stat that folds existing hard links together
   --json              emit the whole result as JSON
   -q                  suppress the trailing summary line
 
 LINK OPTIONS
   --yes               actually create the links (without it, nothing changes)
   --quick             hash a 1MB head and tail instead of the whole file
+  --keep <path>       never replace files under this path; they become the
+                      keepers (repeatable)
+  --save-plan <path>  write the verified plan to a file for review
+  --plan <path>       show or (with --yes) apply a saved plan, without re-planning
   --journal <path>    where to write the undo journal
   --undo <path>       restore independent copies from a journal (needs --yes)
+
+MACOS
+  On the Mac, ev answers from fsearch's index instead of Everything.
+  find, recent, big, count, size, ext, raw and doctor work. du and dupes
+  refuse (no folder-size rollups; APFS clones); link only shows saved plans
+  and undoes. --case, --whole-word, --sort created, and --match-path without
+  --regex refuse. find without --sort keeps fsearch's relevance ranking, and
+  query words are fsearch syntax: fuzzy, typo-tolerant, 'exact, ^prefix,
+  suffix$, !exclude.
+  --grep <text>       content search (literal), with any name filters above
+  --grep-regex <re>   content search (regular expression)
 
 CONFIG
   Defaults need no config file. Override with $EV_ES_PATH, $EV_INSTANCE,
@@ -77,26 +95,35 @@ EXAMPLES
   ev link --ext safetensors,onnx --larger 100M          # plan, change nothing
   ev link --ext safetensors,onnx --larger 100M --yes    # apply
   ev link --undo C:\\Tools\\ev-journal-....json --yes   # put the copies back
+
+  # a mirror between two trees: keep one side untouched, review, then apply
+  ev link --under D:\\Downloads\\n --under D:\\Media --keep D:\\Downloads\\n --save-plan plan.json
+  ev link --plan plan.json --yes
 `;
 
 interface Flags {
   positional: string[];
   str: Map<string, string>;
+  /** Every value of a repeatable flag, in order. */
+  multi: Map<string, string[]>;
   bool: Set<string>;
 }
 
 const STR_FLAGS = new Set([
   "--ext", "--under", "--parent", "--larger", "--smaller", "--after", "--before",
   "-n", "--offset", "--sort", "--cap", "--journal", "--undo", "--depth",
+  "--keep", "--save-plan", "--plan", "--grep", "--grep-regex",
 ]);
+const MULTI_FLAGS = new Set(["--under", "--keep"]);
 const BOOL_FLAGS = new Set([
   "--files", "--folders", "--regex", "--case", "--whole-word", "--match-path",
-  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick",
+  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick", "--index-only",
 ]);
 
 function parseFlags(argv: string[]): Flags {
   const positional: string[] = [];
   const str = new Map<string, string>();
+  const multi = new Map<string, string[]>();
   const bool = new Set<string>();
 
   for (let i = 0; i < argv.length; i++) {
@@ -104,6 +131,8 @@ function parseFlags(argv: string[]): Flags {
     if (STR_FLAGS.has(a)) {
       const v = argv[++i];
       if (v === undefined) throw new Error(`${a} needs a value`);
+      if (MULTI_FLAGS.has(a)) multi.set(a, [...(multi.get(a) ?? []), v]);
+      else if (str.has(a)) throw new Error(`${a} was given twice`);
       str.set(a, v);
     } else if (BOOL_FLAGS.has(a)) {
       bool.add(a);
@@ -114,7 +143,35 @@ function parseFlags(argv: string[]): Flags {
       positional.push(a);
     }
   }
-  return { positional, str, bool };
+  return { positional, str, multi, bool };
+}
+
+function lower(p: string): string {
+  return p.replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase() + "\\";
+}
+
+/** Every --under root. Nested roots would count the inner tree twice. */
+function roots(f: Flags): string[] {
+  const all = f.multi.get("--under") ?? [];
+  for (const a of all) {
+    for (const b of all) {
+      if (a !== b && lower(b).startsWith(lower(a))) throw new Error(`--under ${JSON.stringify(b)} is inside --under ${JSON.stringify(a)}; give disjoint trees`);
+    }
+  }
+  return all;
+}
+
+/** Throttled to one line per 5s, plus the last, so a 400-file run logs readably. */
+function progressWriter(quiet: boolean): ((p: Progress) => void) | undefined {
+  if (quiet) return undefined;
+  let last = 0;
+  return (p) => {
+    const now = Date.now();
+    const final = p.done === p.total;
+    if (!final && now - last < 5000) return;
+    last = now;
+    process.stderr.write(renderProgress(p) + "\n");
+  };
 }
 
 function intFlag(f: Flags, name: string, fallback: number): number {
@@ -133,8 +190,9 @@ function buildSpec(f: Flags, terms: string[], defaultLimit: number, defaultSort?
   const ext = f.str.get("--ext");
   if (ext) spec.ext = ext.split(",").map((s) => s.trim().replace(/^\./, "")).filter(Boolean);
 
-  const under = f.str.get("--under");
-  if (under) spec.under = under;
+  const under = f.multi.get("--under") ?? [];
+  // dupes and link pass several roots separately; everything else takes one.
+  if (under.length === 1) spec.under = under[0];
   const parent = f.str.get("--parent");
   if (parent) spec.parent = parent;
 
@@ -192,8 +250,10 @@ async function main(argv: string[]): Promise<number> {
   // `raw` is an escape hatch: forward argv untouched, no flag parsing of our own.
   const cfg = loadConfig();
   const es = makeClient(cfg.esPath, cfg.instance);
+  const backend = selectBackend(process.platform, process.env);
 
   if (cmd === "raw") {
+    if (backend === "fsearch") return runFsearchRaw(rest, { out });
     out((await es.raw(rest)).trimEnd());
     return 0;
   }
@@ -205,6 +265,17 @@ async function main(argv: string[]): Promise<number> {
   }
   const json = f.bool.has("--json");
   const quiet = f.bool.has("-q");
+  if (cmd !== "dupes" && cmd !== "link" && (f.multi.get("--under")?.length ?? 0) > 1) {
+    throw new Error(`only dupes and link accept --under more than once`);
+  }
+  if (cmd !== "link" && f.multi.has("--keep")) throw new Error(`--keep only applies to ev link`);
+  if (backend !== "fsearch" && (f.str.has("--grep") || f.str.has("--grep-regex"))) throw new Error(GREP_OFF_MAC);
+
+  if (backend === "fsearch") {
+    const err = (s: string) => process.stderr.write(s + "\n");
+    const code = await runFsearch(cmd, f, { buildSpec, intFlag, roots, out, err, defaultLimit: DEFAULTS.limit });
+    if (code !== undefined) return code;
+  }
 
   if (cmd === "doctor") {
     const d = await doctor(es, cfg.esPath, cfg.instance);
@@ -263,20 +334,42 @@ async function main(argv: string[]): Promise<number> {
     }
 
     const limit = intFlag(f, "-n", 20);
-    const cap = intFlag(f, "--cap", 50_000);
-    const minSize = f.str.get("--larger") ? parseSize(f.str.get("--larger")!) : 1024 * 1024;
-    const spec = buildSpec(f, f.positional, cap);
-    const candidates = await dupes(es, spec, cap);
-    const plan = await planLinks(candidates.groups, fsDeps, { minSize });
+    const progress = progressWriter(quiet);
+    const planPath = f.str.get("--plan");
+    let plan: LinkPlan;
+    if (planPath) {
+      const saved = parsePlan(JSON.parse(readFileSync(planPath, "utf8")));
+      if (apply && saved.quick) throw new Error(`${planPath} was planned with --quick; re-plan without it before --yes`);
+      plan = saved;
+      if (!apply) {
+        out(json ? JSON.stringify(plan, null, 2) : renderLinkPlan(plan, limit, false, `Apply with: ev link --plan "${planPath}" --yes`));
+        return 0;
+      }
+    } else {
+      const cap = intFlag(f, "--cap", 50_000);
+      const minSize = f.str.get("--larger") ? parseSize(f.str.get("--larger")!) : 1024 * 1024;
+      const spec = buildSpec(f, f.positional, cap);
+      if (backend === "fsearch") throw new Error(LINK_ON_MAC);
+      const candidates = await dupes(es, spec, cap, roots(f));
+      plan = await planLinks(candidates.groups, fsDeps, { minSize, keep: f.multi.get("--keep") ?? [], onProgress: progress });
 
-    if (!apply) {
-      out(json ? JSON.stringify(plan, null, 2) : renderLinkPlan(plan, limit, false));
-      return 0;
+      const savePath = f.str.get("--save-plan");
+      if (savePath) {
+        const saved: SavedPlan = { version: 1, created: new Date().toISOString(), quick: f.bool.has("--quick"), ...plan };
+        // "wx": a reviewed plan is evidence of what was approved; never overwrite one.
+        writeFileSync(savePath, JSON.stringify(saved, null, 2), { flag: "wx" });
+      }
+      if (!apply) {
+        const hint = savePath ? `Apply exactly this plan with: ev link --plan "${savePath}" --yes` : undefined;
+        out(json ? JSON.stringify(plan, null, 2) : renderLinkPlan(plan, limit, false, hint));
+        return 0;
+      }
     }
+    if (backend === "fsearch") throw new Error(LINK_ON_MAC);
     const journalPath =
       f.str.get("--journal") ?? `ev-journal-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
     const saveJournal = createJournalWriter(journalPath);
-    const result = await applyLinks(plan, fsDeps, saveJournal);
+    const result = await applyLinks(plan, fsDeps, saveJournal, progress);
     saveJournal(result.journal);
     out(json ? JSON.stringify({ ...result, journalPath }, null, 2) : renderApply(result, journalPath));
     return result.failures.length ? 1 : 0;
@@ -286,7 +379,14 @@ async function main(argv: string[]): Promise<number> {
     const limit = intFlag(f, "-n", 40);
     const cap = intFlag(f, "--cap", 50_000);
     const spec = buildSpec(f, f.positional, cap);
-    const r = await dupes(es, spec, cap);
+    const fsDeps = makeFsDeps();
+    const identify = f.bool.has("--index-only")
+      ? undefined
+      : async (p: string) => {
+          const facts = await fsDeps.facts(p);
+          return facts ? `${facts.dev}:${facts.ino}` : null;
+        };
+    const r = await dupes(es, spec, cap, roots(f), identify);
     out(json ? JSON.stringify(r, null, 2) : renderDupes(r, limit));
     return 0;
   }

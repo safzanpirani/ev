@@ -36,7 +36,8 @@ export type SkipReason =
   | "hash-mismatch"
   | "unreadable"
   | "symlink"
-  | "too-small";
+  | "too-small"
+  | "kept";
 
 export interface Skipped {
   path: string;
@@ -97,9 +98,25 @@ export function isLinkable(path: string): boolean {
   return true;
 }
 
-/** Shortest path wins, with an already-shared file preferred — deterministic. */
-function pickKeeper(entries: Array<{ path: string; facts: FileFacts }>): string {
+/** Lowercased with one trailing backslash, so `D:\Media` never matches `D:\Media2`. */
+function dirPrefix(dir: string): string {
+  return dir.replaceAll("/", "\\").replace(/\\+$/, "").toLowerCase() + "\\";
+}
+
+/** Pure. True when `path` sits under one of the `--keep` directories. */
+export function isKept(path: string, keep: string[]): boolean {
+  const p = path.replaceAll("/", "\\").toLowerCase();
+  return keep.some((dir) => p.startsWith(dirPrefix(dir)));
+}
+
+/**
+ * A kept file wins first, then an already-shared file, then the shortest path —
+ * deterministic.
+ */
+function pickKeeper(entries: Array<{ path: string; facts: FileFacts }>, keep: string[] = []): string {
   const sorted = [...entries].sort((a, b) => {
+    const ka = isKept(a.path, keep), kb = isKept(b.path, keep);
+    if (ka !== kb) return ka ? -1 : 1;
     if (a.facts.nlink !== b.facts.nlink) return b.facts.nlink - a.facts.nlink;
     if (a.path.length !== b.path.length) return a.path.length - b.path.length;
     return a.path < b.path ? -1 : 1;
@@ -107,8 +124,19 @@ function pickKeeper(entries: Array<{ path: string; facts: FileFacts }>): string 
   return sorted[0]!.path;
 }
 
+export type Progress =
+  | { phase: "hash"; done: number; total: number; bytes: number; totalBytes: number; path: string }
+  | { phase: "link"; done: number; total: number; bytes: number; totalBytes: number; path: string };
+
 export interface PlanOptions {
   minSize?: number;
+  /**
+   * Directories whose files are never replaced. A kept file becomes the keeper
+   * of its group, so another application reading that tree (Stash, Jellyfin)
+   * sees the same inode, timestamps and bytes it saw before.
+   */
+  keep?: string[];
+  onProgress?: (p: Progress) => void;
 }
 
 /**
@@ -124,9 +152,16 @@ export async function planLinks(
   opts: PlanOptions = {},
 ): Promise<LinkPlan> {
   const minSize = opts.minSize ?? 1024 * 1024;
+  const keep = opts.keep ?? [];
   const out: LinkGroup[] = [];
   const skipped: Skipped[] = [];
   let hashedBytes = 0;
+
+  // An upper bound: denied, unreadable and single-volume leftovers are never hashed.
+  const eligible = groups.filter((g) => g.size >= minSize);
+  const totalFiles = eligible.reduce((n, g) => n + g.paths.length, 0);
+  const totalBytes = eligible.reduce((n, g) => n + g.size * g.paths.length, 0);
+  let hashedFiles = 0;
 
   for (const g of groups) {
     if (g.size < minSize) {
@@ -170,16 +205,26 @@ export async function planLinks(
       if (entries.length < 2) continue;
 
       // Hash confirms content. Name and size never justify replacing a file.
+      // Paths sharing an inode are one file, so each inode is read once: a
+      // library that is already hard-linked costs no reads at all.
       const hashes = new Map<string, Array<{ path: string; facts: FileFacts }>>();
+      const byInode = new Map<string, string | null>();
       for (const e of entries) {
-        let h: string;
-        try {
-          h = await deps.hash(e.path);
-        } catch {
+        let h = byInode.get(e.facts.ino);
+        if (h === undefined) {
+          try {
+            h = await deps.hash(e.path);
+            hashedBytes += e.facts.size;
+          } catch {
+            h = null;
+          }
+          byInode.set(e.facts.ino, h);
+        }
+        opts.onProgress?.({ phase: "hash", done: ++hashedFiles, total: totalFiles, bytes: hashedBytes, totalBytes, path: e.path });
+        if (h === null) {
           skipped.push({ path: e.path, reason: "unreadable" });
           continue;
         }
-        hashedBytes += e.facts.size;
         const list = hashes.get(h) ?? [];
         list.push(e);
         hashes.set(h, list);
@@ -190,13 +235,17 @@ export async function planLinks(
           for (const e of matched) skipped.push({ path: e.path, reason: "hash-mismatch" });
           continue;
         }
-        const keeper = pickKeeper(matched);
+        const keeper = pickKeeper(matched, keep);
         const keeperIno = matched.find((e) => e.path === keeper)!.facts.ino;
         const replace: string[] = [];
         for (const e of matched) {
           if (e.path === keeper) continue;
           if (e.facts.ino === keeperIno) {
             skipped.push({ path: e.path, reason: "already-linked" });
+            continue;
+          }
+          if (isKept(e.path, keep)) {
+            skipped.push({ path: e.path, reason: "kept" });
             continue;
           }
           replace.push(e.path);
@@ -210,6 +259,45 @@ export async function planLinks(
 
   out.sort((a, b) => b.reclaim - a.reclaim);
   return { groups: out, reclaim: out.reduce((s, g) => s + g.reclaim, 0), skipped, hashedBytes };
+}
+
+/** A plan written by `--save-plan`, so `--plan` applies exactly what was reviewed. */
+export interface SavedPlan extends LinkPlan {
+  version: 1;
+  created: string;
+  /** Hashes from --quick are samples; a saved quick plan can be read, never applied. */
+  quick: boolean;
+}
+
+const isPath = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+const isSize = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+
+/**
+ * Validate a saved plan. Apply re-checks identity and full hashes of every
+ * file, so a hand-edited plan can at worst link less, never link wrong bytes —
+ * but a malformed one should fail here with a clear message, not mid-apply.
+ */
+export function parsePlan(raw: unknown): SavedPlan {
+  const o = raw as Partial<SavedPlan> | null;
+  if (!o || o.version !== 1 || typeof o.quick !== "boolean" || !Array.isArray(o.groups) || !Array.isArray(o.skipped)) {
+    throw new Error("invalid ev link plan (expected a file written by --save-plan)");
+  }
+  for (const g of o.groups) {
+    if (!g || !isPath(g.keeper) || !Array.isArray(g.replace) || !g.replace.every(isPath) || g.replace.includes(g.keeper) ||
+        !isSize(g.size) || !isPath(g.hash)) {
+      throw new Error("invalid ev link plan: malformed group");
+    }
+  }
+  const groups = o.groups.map((g) => ({ ...g, reclaim: g.size * g.replace.length }));
+  return {
+    version: 1,
+    created: typeof o.created === "string" ? o.created : "",
+    quick: o.quick,
+    groups,
+    reclaim: groups.reduce((n, g) => n + g.reclaim, 0),
+    skipped: o.skipped,
+    hashedBytes: isSize(o.hashedBytes) ? o.hashedBytes : 0,
+  };
 }
 
 export interface JournalEntry {
@@ -247,14 +335,18 @@ export async function applyLinks(
   plan: LinkPlan,
   deps: LinkDeps,
   saveJournal?: (journal: Journal) => Promise<void> | void,
+  onProgress?: (p: Progress) => void,
 ): Promise<ApplyResult> {
   const entries: JournalEntry[] = [];
   const failures: Array<{ path: string; error: string }> = [];
   let reclaimed = 0;
   const created = (deps.now ?? (() => new Date().toISOString()))();
+  const total = plan.groups.reduce((n, g) => n + g.replace.length, 0);
+  let done = 0;
 
   for (const g of plan.groups) {
     for (const target of g.replace) {
+      onProgress?.({ phase: "link", done: ++done, total, bytes: reclaimed, totalBytes: plan.reclaim, path: target });
       const tmp = `${target}.evlink-tmp-${crypto.randomUUID()}`;
       let ownsTemporary = false;
       try {

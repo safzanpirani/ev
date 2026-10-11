@@ -42,3 +42,44 @@ test("quick sampling is rejected for a real apply before Everything is queried",
   expect(stdout).toBe("");
   expect(stderr).toContain("--quick is only available for dry runs");
 });
+
+async function runCli(args: string[]) {
+  const proc = Bun.spawn([process.execPath, "run", "src/cli.ts", ...args], {
+    cwd: join(import.meta.dir, ".."),
+    env: { ...process.env, EV_CONFIG: "/nonexistent/ev/config.json", EV_ES_PATH: "/nonexistent/es.exe" },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { code, stdout, stderr };
+}
+
+test("a saved quick plan can be shown but never applied", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ev-plan-test-"));
+  try {
+    const planPath = join(root, "plan.json");
+    await writeFile(planPath, JSON.stringify({
+      version: 1, created: "x", quick: true, skipped: [], hashedBytes: 0,
+      groups: [{ keeper: join(root, "a"), replace: [join(root, "b")], size: 5, hash: "h", reclaim: 5 }],
+    }));
+    const shown = await runCli(["link", "--plan", planPath]);
+    expect(shown.code).toBe(0);
+    expect(shown.stdout).toContain(`Apply with: ev link --plan "${planPath}" --yes`);
+    const applied = await runCli(["link", "--plan", planPath, "--yes"]);
+    expect(applied.code).toBe(1);
+    expect(applied.stderr).toContain("planned with --quick");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("--under twice is refused where it would silently mean one root", async () => {
+  const r = await runCli(["find", "--under", "D:\\a", "--under", "D:\\b"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("only dupes and link accept --under more than once");
+});
+
+test("nested --under roots are refused before Everything is queried", async () => {
+  const r = await runCli(["dupes", "--under", "D:\\Downloads", "--under", "D:\\Downloads\\n"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("give disjoint trees");
+});

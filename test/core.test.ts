@@ -249,6 +249,42 @@ describe("du", () => {
   });
 });
 
+describe("empty result sets", () => {
+  // Pinned from D:\\Media on main: one subfolder, no loose files. ES answered
+  // -get-total-size -parent with the unknown-size sentinel, and du failed.
+  test("a folder with no loose files rolls up instead of failing", async () => {
+    const { run } = fakeEs([
+      { match: /-get-total-size -path/, stdout: "35062811298" },
+      { match: /-get-total-size -parent/, stdout: "18446744073709551615" },
+      { match: /-get-result-count -parent/, stdout: "0" },
+      { match: /\/ad/, stdout: JSON.stringify([{ filename: "D:\\Media\\n\\", size: 35062811298 }]) },
+      { match: /\/a-d/, stdout: "[]" },
+    ]);
+    const r = await du(makeClient("es.exe", "1.5a", run), "D:\\Media");
+    expect(r.fileTotal).toBe(0);
+    expect(r.folderTotal).toBe(35062811298);
+    expect(r.grandTotal).toBe(35062811298);
+  });
+
+  test("an unknown size over real matches still fails loudly", async () => {
+    const { run } = fakeEs([
+      { match: /-get-total-size/, stdout: "18446744073709551615" },
+      { match: /-get-result-count/, stdout: "3" },
+      { match: /-json/, stdout: "[]" },
+    ]);
+    await expect(du(makeClient("es.exe", "1.5a", run), "E:\\")).rejects.toThrow(/did not report indexed file sizes/);
+  });
+
+  test("find over nothing reports zero bytes, not an unknown size", async () => {
+    const { run } = fakeEs([
+      { match: /-get-result-count/, stdout: "0" },
+      { match: /-get-total-size/, stdout: "18446744073709551615" },
+      { match: /-json/, stdout: "[]" },
+    ]);
+    expect((await find(makeClient("es.exe", "1.5a", run), { terms: ["nothing"] })).totalSize).toBe(0);
+  });
+});
+
 describe("byExtension", () => {
   test("groups by extension and flags an incomplete sample", async () => {
     const { run } = fakeEs([
@@ -301,6 +337,73 @@ describe("dupes", () => {
     expect(r.groups[0]!.paths).toHaveLength(2);
     expect(r.groups[0]!.wasted).toBe(1000);
     expect(r.wastedTotal).toBe(1000);
+  });
+
+  test("several roots are searched separately and grouped together", async () => {
+    const { run, calls } = fakeEs([
+      { match: /-get-result-count -path D:\\Media/, stdout: "1" },
+      { match: /-get-result-count/, stdout: "2" },
+      { match: /-path D:\\Media/, stdout: JSON.stringify([{ filename: "D:\\Media\\a.mp4", size: 1000 }]) },
+      {
+        match: /-path D:\\Downloads/,
+        stdout: JSON.stringify([
+          { filename: "D:\\Downloads\\n\\A.mp4", size: 1000 },
+          { filename: "D:\\Downloads\\n\\solo.mp4", size: 7 },
+        ]),
+      },
+    ]);
+    const r = await dupes(makeClient("es.exe", "1.5a", run), { terms: [] }, 50_000, ["D:\\Media", "D:\\Downloads\\n"]);
+    expect(r.groups).toHaveLength(1);
+    expect(r.groups[0]!.paths.sort()).toEqual(["D:\\Downloads\\n\\A.mp4", "D:\\Media\\a.mp4"]);
+    expect(r.scanned).toBe(3);
+    expect(r.total).toBe(3);
+    expect(r.sampled).toBe(false);
+    expect(calls.filter((c) => c.includes("-json")).map((c) => c[c.indexOf("-path") + 1])).toEqual(["D:\\Media", "D:\\Downloads\\n"]);
+  });
+
+  test("a path returned by two roots is one file, not a duplicate of itself", async () => {
+    const { run } = fakeEs([
+      { match: /-get-result-count/, stdout: "1" },
+      { match: /-json/, stdout: JSON.stringify([{ filename: "D:\\x\\a.bin", size: 10 }]) },
+    ]);
+    const r = await dupes(makeClient("es.exe", "1.5a", run), { terms: [] }, 50_000, ["D:\\x", "D:\\X"]);
+    expect(r.groups).toHaveLength(0);
+  });
+
+  // Pinned from D:\\Media\\n on main: a Jellyfin library built from hard links
+  // into D:\\Downloads\\n. The index saw 146 "duplicates"; disk held one copy.
+  test("paths already hard-linked together are one file, not waste", async () => {
+    const { run } = fakeEs([
+      {
+        match: /-json/,
+        stdout: JSON.stringify([
+          { filename: "D:\\Downloads\\n\\a.mp4", size: 1000 },
+          { filename: "D:\\Media\\n\\a.mp4", size: 1000 },
+          { filename: "D:\\Downloads\\n\\b.mp4", size: 500 },
+          { filename: "D:\\Media\\n\\b.mp4", size: 500 },
+          { filename: "D:\\Old\\b.mp4", size: 500 },
+        ]),
+      },
+    ]);
+    const inode: Record<string, string> = {
+      "D:\\Downloads\\n\\a.mp4": "1", "D:\\Media\\n\\a.mp4": "1",
+      "D:\\Downloads\\n\\b.mp4": "2", "D:\\Media\\n\\b.mp4": "2", "D:\\Old\\b.mp4": "3",
+    };
+    const r = await dupes(makeClient("es.exe", "1.5a", run), { terms: [] }, 50_000, [], async (p) => inode[p] ?? null);
+    expect(r.groups).toHaveLength(1);
+    expect(r.groups[0]!.name).toBe("b.mp4");
+    expect(r.groups[0]!.wasted).toBe(500);
+    expect(r.groups[0]!.linked).toBe(1);
+    expect(r.wastedTotal).toBe(500);
+    expect(r.linkedTotal).toBe(1500);
+  });
+
+  test("an unreadable path is counted as its own file", async () => {
+    const { run } = fakeEs([
+      { match: /-json/, stdout: JSON.stringify([{ filename: "D:\\a\\x", size: 9 }, { filename: "D:\\b\\x", size: 9 }]) },
+    ]);
+    const r = await dupes(makeClient("es.exe", "1.5a", run), { terms: [] }, 50_000, [], async () => null);
+    expect(r.wastedTotal).toBe(9);
   });
 
   test("a different byte size is not a duplicate even with the same name", async () => {
