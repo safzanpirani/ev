@@ -27,6 +27,11 @@ export interface FsQueryOptions {
   grepRegex?: string;
 }
 
+/** Mirror fsearch's search-to-grep dispatch; leave token parsing and pattern precedence to the daemon. */
+export function isFsContentQuery(q: string): boolean {
+  return ["grep:", "regex:", "sym:", "content:", "symbol:"].some((prefix) => q.includes(prefix));
+}
+
 /** Thrown for a flag fsearch cannot express. The message names the flag. */
 export class UnsupportedFlag extends Error {
   constructor(flag: string, why: string) {

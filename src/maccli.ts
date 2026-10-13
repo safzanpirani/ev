@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { realpathSync } from "node:fs";
 import type { QuerySpec, SortKey } from "./query.ts";
+import { buildFsQuery, isFsContentQuery } from "./fsquery.ts";
 import { humanSize } from "./render.ts";
 import { defaultTransport, fsearchPaths, makeFsearchClient, probeTransport, readDaemonFacts, type FsearchClient } from "./fsearch.ts";
 import { byExtension, count, doctor, find, grep, totalSize } from "./mac.ts";
@@ -148,7 +149,9 @@ export async function runFsearch(cmd: string, f: MacFlags, ctx: MacContext): Pro
   }
   spec = withDirs(spec);
 
-  if (grepping) {
+  const contentQuery = isFsContentQuery(buildFsQuery(spec, { limit: 1, now }).q);
+  if (grepping || contentQuery) {
+    if (cmd !== "find") throw new Error(`content query words go with ev find (got ev ${cmd})`);
     const r = await grep(client(), spec, pattern, now);
     if (json) {
       ctx.out(JSON.stringify(r, null, 2));

@@ -67,7 +67,7 @@ The next call restarts it and rescans the skipped folders.
 | Verb | On macOS |
 |---|---|
 | `find`, `recent`, `big`, `count`, `size`, `ext`, `raw`, `doctor` | work |
-| `find --grep <text>`, `--grep-regex <re>` | content search, macOS only |
+| `find --grep <text>`, `--grep-regex <re>`, `find grep:…`, `regex:…`, `sym:…` | content search, macOS only |
 | `du` | refuses: fsearch has no folder-size rollups. Use `sweep dust <dir>` |
 | `dupes` | refuses: APFS clones look like duplicates but share blocks |
 | `link` | shows saved plans and undoes; refuses to plan or apply |
@@ -92,6 +92,13 @@ What differs from Everything:
   `node_modules`, `Library`, `vendor`, build output and caches, so an unscoped
   `--grep` misses them; scope it with `--under` into such a folder and fsearch
   scans disk instead.
+  Native `grep:`, `regex:` and `sym:` words (including `content:` and `symbol:`
+  aliases) use the same content result and `--json` shape as `--grep`, including
+  line matches, `-n`, `--offset` and `-q`. For example,
+  `ev find sym:apply_dir --ext rs` or `ev find "grep:pub fn" --under ~/Development`.
+  Fsearch interprets the native pattern and mode; an explicit `--grep` or
+  `--grep-regex` takes precedence. Content queries require `find`, and `--sort`
+  is unsupported, just as with the content flags.
 
 ## Reclaiming space with hard links
 

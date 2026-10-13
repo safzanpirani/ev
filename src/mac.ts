@@ -14,7 +14,7 @@
 import type { EsRow } from "./es.ts";
 import type { ExtEntry, FindResult } from "./core.ts";
 import type { QuerySpec, SortKey } from "./query.ts";
-import { buildFsQuery, parseWhen, UnsupportedFlag } from "./fsquery.ts";
+import { buildFsQuery, isFsContentQuery, parseWhen, UnsupportedFlag } from "./fsquery.ts";
 import type { DaemonFacts, FsearchClient, FsGrepReply, FsHit, FsStatus } from "./fsearch.ts";
 import { FsearchError } from "./fsearch.ts";
 
@@ -54,7 +54,9 @@ interface Fetched {
 
 /** Up to `cap` matches, asking for one more so a set of exactly `cap` is known to be complete. */
 async function fetchSet(fs: FsearchClient, spec: QuerySpec, cap: number, now: number): Promise<Fetched> {
-  const hits = await fs.search(buildFsQuery(spec, { limit: cap + 1, now }));
+  const req = buildFsQuery(spec, { limit: cap + 1, now });
+  if (isFsContentQuery(req.q)) throw new UnsupportedFlag("content query", "use ev find or ev raw for content matches");
+  const hits = await fs.search(req);
   return hits.length > cap ? { hits: hits.slice(0, cap), complete: false } : { hits, complete: true };
 }
 

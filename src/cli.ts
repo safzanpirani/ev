@@ -75,7 +75,8 @@ MACOS
   and undoes. --case, --whole-word, --sort created, and --match-path without
   --regex refuse. find without --sort keeps fsearch's relevance ranking, and
   query words are fsearch syntax: fuzzy, typo-tolerant, 'exact, ^prefix,
-  suffix$, !exclude.
+  suffix$, !exclude. grep:, regex: and sym: words use content-search output
+  (also content: and symbol: aliases); content queries require find, no --sort.
   --grep <text>       content search (literal), with any name filters above
   --grep-regex <re>   content search (regular expression)
 

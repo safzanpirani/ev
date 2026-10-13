@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { buildFsQuery, parseWhen, UnsupportedFlag, type FsRequest } from "../src/fsquery.ts";
 import { makeFsearchClient, parseGrep, parseHits, parseStatus, FsearchError, type FsHit, type Transport } from "../src/fsearch.ts";
 import { find, count, totalSize, byExtension, topBy, sortHits, toRow, doctor, FIND_TOTAL_CAP } from "../src/mac.ts";
-import { selectBackend, resolveDir } from "../src/maccli.ts";
+import { runFsearch, selectBackend, resolveDir, type MacContext, type MacFlags } from "../src/maccli.ts";
 import { macSummaryLine } from "../src/macrender.ts";
 
 // Real daemon replies, captured from fsearch ffcb37d on the Mac (4.0M entries).
@@ -339,6 +339,74 @@ describe("backend selection", () => {
   test("relative and ~ paths resolve, since fsearch's in: only expands ~", () => {
     expect(resolveDir("~/x/nope", "/Users/me", "/w")).toBe("/Users/me/x/nope");
     expect(resolveDir("rel/nope", "/Users/me", "/w")).toBe("/w/rel/nope");
+  });
+});
+
+describe("native content queries through the macOS frontend", () => {
+  async function run(terms: string[], extra: { json?: boolean; quiet?: boolean; offset?: number; pattern?: string; cmd?: string } = {}) {
+    const requests: Record<string, unknown>[] = [];
+    const output: string[] = [];
+    const errors: string[] = [];
+    const f: MacFlags = {
+      positional: terms,
+      str: new Map(extra.pattern === undefined ? [] : [["--grep", extra.pattern]]),
+      multi: new Map(),
+      bool: new Set([...(extra.json ? ["--json"] : []), ...(extra.quiet ? ["-q"] : [])]),
+    };
+    const ctx: MacContext = {
+      buildSpec: (_flags, words, limit, sort) => ({ terms: words, ext: ["rs"], limit, offset: extra.offset, sort }),
+      intFlag: (_flags, _name, fallback) => fallback,
+      roots: () => [],
+      out: (s) => output.push(s),
+      err: (s) => errors.push(s),
+      defaultLimit: 1,
+      now: () => NOW,
+      client: makeFsearchClient(async (req) => {
+        requests.push(req);
+        return reply(REAL.grep);
+      }),
+    };
+    const code = await runFsearch(extra.cmd ?? "find", f, ctx);
+    return { code, requests, output, errors };
+  }
+
+  for (const word of ["sym:apply_dir", "grep:apply_dir", "regex:apply_.*", "content:apply_dir", "symbol:apply_dir"]) {
+    test(`${word} keeps its native pattern and receives a content result`, async () => {
+      const r = await run([word, "live"], { json: true });
+      expect(r.code).toBe(0);
+      expect(r.requests).toEqual([{ q: `${word} live ext:rs`, limit: 1, op: "grep" }]);
+      expect(JSON.parse(r.output[0]!)).toMatchObject({
+        files: [{ path: "/Users/safzan/Development/vendor/fsearch/src/live.rs", matches: [{ line: 201 }] }],
+        source: "scan", complete: true, shown: 1, offset: 0,
+      });
+      expect(r.errors).toEqual([]);
+    });
+  }
+
+  test("quoted native patterns keep spaces and content rendering, not name rows", async () => {
+    const r = await run(["grep:pub fn"]);
+    expect(r.requests[0]).toEqual({ q: '"grep:pub fn" ext:rs', limit: 1, op: "grep" });
+    expect(r.output[0]).toContain("pub fn apply_dir");
+    expect(r.output[0]).toContain("201");
+    expect(r.errors).toHaveLength(1);
+  });
+
+  test("native content queries honor offset, limit and quiet output", async () => {
+    const r = await run(["sym:apply_dir"], { offset: 1, quiet: true });
+    expect(r.requests[0]!["limit"]).toBe(2);
+    expect(r.output).toEqual([""]);
+    expect(r.errors).toEqual([]);
+  });
+
+  test("explicit content flags retain daemon precedence over native words", async () => {
+    const r = await run(["sym:apply_dir"], { json: true, pattern: 'say "hi"' });
+    expect(r.requests[0]).toEqual({ q: "sym:apply_dir ext:rs", limit: 1, op: "grep", pattern: 'say "hi"', mode: "literal" });
+  });
+
+  test("name-only verbs reject native content words before contacting the daemon", async () => {
+    for (const cmd of ["recent", "count", "size"]) {
+      await expect(run(["sym:apply_dir"], { cmd })).rejects.toThrow(/ev find/);
+    }
   });
 });
 
