@@ -9,7 +9,7 @@
   "scripts": {
     "ev": "bun run src/cli.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsrs --noEmit",
     "check": "bun run typecheck && bun test",
     "build:local": "bun build --compile src/cli.ts --outfile dist/ev",
     "build:linux": "bun build --compile --target=bun-linux-x64 src/cli.ts --outfile dist/ev-linux-x64",
@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "tsrs": "0.16.0-ts7.1.0-dev.20260929",
     "typescript": "^5"
   }
 }
