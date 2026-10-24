@@ -102,13 +102,14 @@ MACOS
 
 LINUX
   On Linux, plocate names the matches from ev's own index and lstat supplies
-  sizes and dates, so sizes are current and names are as fresh as the last
-  'ev index' (an hourly ev-index.timer keeps it fresh; listings say when it is
-  over 2h old). Every verb works. du and ext add up the files under the path
-  at query time, and hard links count once. Query words are substrings or
-  globs matched against names, !word excludes; Everything syntax words such as
-  size: or dm: refuse, so use the flags. --cap (default 2000000) bounds how many
-  index entries one query reads. Override the index path with $EV_LOCATE_DB.
+  file sizes and dates at query time. 'ev index' (run hourly by ev-index.timer)
+  rebuilds the names and a folder-size cache, so du is instant; listings say
+  when the index is over 2h old. Every verb works. big, ext and dupes stat
+  their matches, so narrow them on large NTFS drives. Hard links count once.
+  Query words are substrings or globs matched against names, !word excludes;
+  Everything syntax words such as size: or dm: refuse, so use the flags. --cap
+  (default 2000000) bounds how many index entries one query reads. Override
+  the paths with $EV_LOCATE_DB and $EV_SIZES_DB.
 
 CONFIG
   Defaults need no config file. Override with $EV_ES_PATH, $EV_INSTANCE,

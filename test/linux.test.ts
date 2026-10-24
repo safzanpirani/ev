@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { collect, planQueries, toDu, toDuTree, toDupes, toFind, type LxRow } from "../src/linux.ts";
-import { mountView, linuxNotes } from "../src/linuxcli.ts";
-import type { LocateClient, PathQuery } from "../src/locate.ts";
+import { linuxNotes } from "../src/linuxcli.ts";
+import { mountPlan, type LocateClient, type PathQuery } from "../src/locate.ts";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
 
@@ -123,15 +123,23 @@ describe("listings and rollups", () => {
   });
 });
 
-test("doctor's mount view keeps real disks, names network drives, hides kernel views", () => {
-  const v = mountView([
-    "/dev/nvme0n1p9 / btrfs rw 0 0",
-    "proc /proc proc rw 0 0",
-    "/dev/sda1 /mnt/D\\040Drive fuseblk rw 0 0",
-    "/dev/sdb1 /mnt/z ntfs3 rw 0 0",
-    "nas:/x /mnt/nas nfs4 rw 0 0",
-    "tmpfs /tmp tmpfs rw 0 0",
+// Lines from main's Omarchy boot, 2026-10-24. The first index run there held 325k
+// entries: updatedb pruned /home as a bind mount and every NTFS automount as autofs,
+// and waited 90 s on the unmounted /mnt/nvme-500gb.
+test("the mount plan indexes subvolumes and mounted automounts, prunes binds and empty automounts", () => {
+  const p = mountPlan([
+    "33 2 0:30 /@ / rw,noatime shared:1 - btrfs /dev/nvme0n1p9 rw,subvol=/@",
+    "26 33 0:24 / /proc rw shared:5 - proc proc rw",
+    "152 33 0:30 /@home /home rw,noatime shared:192 - btrfs /dev/nvme0n1p9 rw,subvol=/@home",
+    "103 33 259:6 / /mnt/shared rw,noatime shared:182 - ext4 /dev/nvme0n1p7 rw",
+    "147 33 259:6 /jellyfin /var/lib/jellyfin rw,noatime shared:182 - ext4 /dev/nvme0n1p7 rw",
+    "66 33 0:54 / /mnt/windows-c rw,relatime shared:102 - autofs systemd-1 rw,direct",
+    "426 66 259:2 / /mnt/windows-c rw,relatime shared:734 - fuseblk /dev/nvme0n1p2 rw",
+    "63 33 0:53 / /mnt/nvme-500gb rw,relatime shared:99 - autofs systemd-1 rw,direct",
+    "599 281 0:84 / /home/x/gvfs rw shared:646 - fuse.gvfsd-fuse gvfsd-fuse rw",
+    "700 33 0:90 / /mnt/My\\040Drive rw shared:9 - ntfs3 /dev/sdd1 rw",
   ].join("\n"));
-  expect(v.indexed.map((m) => m.path)).toEqual(["/", "/mnt/D Drive", "/mnt/z"]);
-  expect(v.skipped).toEqual([{ path: "/mnt/nas", fs: "nfs4" }]);
+  expect(p.indexed.map((m) => m.path)).toEqual(["/", "/home", "/mnt/shared", "/mnt/windows-c", "/mnt/My Drive"]);
+  expect(p.prune).toEqual(["/var/lib/jellyfin", "/mnt/nvme-500gb"]);
+  expect(p.skipped.map((m) => m.why)).toEqual(["bind mount of /mnt/shared", "automount with nothing mounted", "network or FUSE drive"]);
 });

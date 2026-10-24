@@ -41,10 +41,56 @@ machine-PATH edit does not reach SSH sessions until main reboots.
 Requires voidtools' `es.exe` on main (defaults to `C:\Tools\es\es.exe`) and
 Everything running.
 
+## Linux
+
+No open-source Linux tool pairs Everything-style instant name search with a
+command line, live folder sizes and machine-readable output, so on Linux `ev`
+composes two standard pieces: [plocate](https://plocate.sesse.net/) names the
+matches from a database `ev` builds for itself, and `lstat` supplies each match's
+size, dates and file identity at query time.
+
+```bash
+sudo pacman -S plocate                       # plocate + its updatedb
+bun run build:linux && install -m755 dist/ev-linux-x64 ~/.local/bin/ev
+ev index                                     # first build reads every disk
+install -Dm644 deploy/linux/ev-index.{service,timer} -t ~/.config/systemd/user/
+systemctl --user enable --now ev-index.timer # hourly refresh
+ev doctor
+```
+
+- **Names come from `ev`'s own database** (`~/.local/share/ev/plocate.db`, or
+  `$EV_LOCATE_DB`). `updatedb -l 0` builds it without root. Its prune list drops
+  kernel views, tmpfs, network and cloud mounts, and keeps every real disk,
+  including NTFS through `ntfs3` or `ntfs-3g`, which the stock
+  `/etc/updatedb.conf` leaves out (it prunes all of `/mnt`). `ev` reads `/proc/self/mountinfo` to decide
+  the rest: btrfs subvolumes such as `/home` stay in although updatedb's own
+  bind-mount check drops them, real bind mounts are pruned so nothing is listed
+  twice, and a systemd automount with nothing mounted is pruned, because
+  entering it waits out the 90 s device timeout.
+- **Folder sizes come from a cache** (`~/.local/share/ev/sizes.db`, or
+  `$EV_SIZES_DB`). An `lstat` through `ntfs-3g` costs about 38 µs, so adding up a
+  4M-entry NTFS drive at query time took 77 s. `ev index` therefore also walks
+  each mount once with `find -printf` and stores every folder's total in SQLite.
+  `du` reads folder totals from it and stats only the loose files of the folders
+  it shows. A folder the cache does not know is added up at query time.
+- **Names and folder totals are as fresh as the last `ev index`; file sizes and
+  dates are current.** A listing says when matched entries no longer exist and
+  when the index is more than two hours old.
+- **Every verb works.** `big`, `ext` and `dupes` stat their matches at query time
+  (`--cap`, default 2,000,000 entries), so narrow them with `--larger` or `--ext`
+  on large NTFS drives. Hard links count once. `dupes` folds hard links, `link`
+  uses the same verified planner as on main with Linux system trees (`/usr`,
+  `/etc`, `/boot`, `/var/lib`, btrfs `/.snapshots`, and so on) refused, and
+  `--grep` reads the files the index names.
+- **Query words** are substrings or globs matched against names (`--match-path`
+  for the whole path), ignoring case unless `--case`; `!word` excludes. Everything
+  syntax words such as `size:` or `dm:` are refused with the flags that replace
+  them.
+
 ## macOS
 
 On the Mac, `ev` answers from [fsearch](https://github.com/noahdunnagan/fsearch)'s
-index instead of Everything. The backend follows the platform (`$EV_BACKEND=es|fsearch`
+index instead of Everything. The backend follows the platform (`$EV_BACKEND=es|fsearch|locate`
 overrides it), and the verbs, flags, row shape and `--json` shape stay the same.
 
 ```bash
@@ -202,12 +248,15 @@ render.ts   pure: data in, string out
 es.ts       the one file that owns es.exe
 fsdeps.ts   the one file that owns the filesystem
 config.ts   optional; defaults are correct on main
-grep.ts     content search on main: the index names candidates, ev reads them
+grep.ts     content search: the index names candidates, ev reads them
 maccli.ts   macOS frontend: the same verbs, answered by fsearch
 mac.ts      macOS actions: find, count, size, ext, grep, doctor — never prints
 fsquery.ts  pure: QuerySpec in, fsearch query out; unsupported flags fail here
 fsearch.ts  the one file that owns fsearch (socket, daemon start, reply parsing)
 macrender.ts pure: macOS results in, string out
+linuxcli.ts Linux frontend: the same verbs, answered by plocate and lstat
+linux.ts    Linux actions: collect, rollups, dupes, grep — never prints
+locate.ts   the one file that owns plocate and updatedb
 ```
 
 Every action takes an injectable runner, so the tests drive a fake `es.exe` and

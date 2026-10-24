@@ -86,24 +86,21 @@ function wordRe(w: string, matchCase: boolean): RegExp {
   return new RegExp(`(^|[^\\p{L}\\p{N}])${esc}([^\\p{L}\\p{N}]|$)`, matchCase ? "u" : "iu");
 }
 
+/** Local wall-clock time, as es.exe prints dates on main. */
+function localIso(ms: number): string {
+  return new Date(ms - new Date(ms).getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
+}
+
+/** Dates are formatted only for the rows a listing shows; a du over millions of files never needs them. */
+export function withDates(r: LxRow): LxRow {
+  return { ...r, date_modified: localIso(r.mtimeMs), date_created: localIso(r.birthMs) };
+}
+
 function statRow(p: string): LxRow | null {
-  let s;
-  try {
-    s = lstatSync(p);
-  } catch {
-    return null;
-  }
+  const s = lstatSync(p, { throwIfNoEntry: false });
+  if (!s) return null;
   const kind = s.isDirectory() ? "dir" : s.isFile() ? "file" : s.isSymbolicLink() ? "link" : "other";
-  const row: LxRow = {
-    filename: p,
-    kind,
-    bytes: kind === "dir" ? 0 : s.size,
-    mtimeMs: s.mtimeMs,
-    birthMs: s.birthtimeMs,
-    id: `${s.dev}:${s.ino}`,
-    date_modified: new Date(s.mtimeMs).toISOString().slice(0, 19),
-    date_created: new Date(s.birthtimeMs).toISOString().slice(0, 19),
-  };
+  const row: LxRow = { filename: p, kind, bytes: kind === "dir" ? 0 : s.size, mtimeMs: s.mtimeMs, birthMs: s.birthtimeMs, id: `${s.dev}:${s.ino}` };
   if (kind !== "dir") row.size = s.size;
   return row;
 }
@@ -126,12 +123,15 @@ export async function collect(locate: LocateClient, spec: QuerySpec, opts: { cap
   const whole = spec.wholeWord ? include.map((w) => wordRe(w, matchCase)) : [];
   const extSet = spec.regex && spec.ext?.length ? new Set(spec.ext.map((e) => e.toLowerCase())) : undefined;
 
-  const seen = new Set<string>();
+  // One plocate run cannot repeat a path, so only merged runs need the set.
+  const seen = lists.length > 1 ? new Set<string>() : undefined;
   const names: string[] = [];
   for (const list of lists) {
     for (const p of list) {
-      if (seen.has(p)) continue;
-      seen.add(p);
+      if (seen) {
+        if (seen.has(p)) continue;
+        seen.add(p);
+      }
       if (under && !isUnder(p, under)) continue;
       if (parent && parentOf(p) !== parent) continue;
       const subject = spec.matchPath ? p : nameOf(p);
@@ -219,7 +219,7 @@ function fileBytes(rows: LxRow[]): number {
 export function toFind(c: Collected, spec: QuerySpec): LxFindResult {
   const sorted = sortRows(c.rows, spec.sort, spec.ascending ?? false);
   const offset = spec.offset ?? 0;
-  const rows = sorted.slice(offset, offset + (spec.limit ?? 50));
+  const rows = sorted.slice(offset, offset + (spec.limit ?? 50)).map(withDates);
   const onlyFolders = c.rows.length > 0 && c.rows.every((r) => r.kind === "dir");
   return {
     rows,

@@ -1,12 +1,13 @@
 // The Linux frontend: the same verbs and flags as cli.ts, answered by plocate
 // names plus lstat. cli.ts parses flags and hands over here on Linux.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type { QuerySpec, SortKey } from "./query.ts";
 import { duration, humanSize, renderDu, renderDuTree, renderDupes, renderExt } from "./render.ts";
 import { renderGrepLines } from "./macrender.ts";
 import { mainGrepSummary } from "./grep.ts";
-import { makeLocate, defaultRun, PRUNE_FS, PRUNE_PATHS, type LocateClient, type Run } from "./locate.ts";
+import { makeLocate, defaultRun, mountPlan, PRUNE_PATHS, type LocateClient, type MountPlan, type Run } from "./locate.ts";
+import { SizeAccumulator, cachedDu, cachedDuTree, defaultSizesDb, openSizes, saveSizes, walk } from "./sizes.ts";
 import { collect, grepLinux, toDu, toDuTree, toDupes, toExt, toFind, type Collected, type LxFindResult } from "./linux.ts";
 import type { DupesResult } from "./core.ts";
 import { resolveDir, type MacFlags } from "./maccli.ts";
@@ -21,6 +22,8 @@ export interface LinuxContext {
   defaultLimit: number;
   locate?: LocateClient;
   run?: Run;
+  /** Folder-size cache path, for tests. */
+  sizesDb?: string;
   now?: () => number;
 }
 
@@ -62,31 +65,6 @@ export function linuxNotes(c: Pick<Collected, "gone" | "sampled" | "matched">, b
   return notes;
 }
 
-interface MountView {
-  indexed: Array<{ path: string; fs: string }>;
-  skipped: Array<{ path: string; fs: string }>;
-}
-
-/** Pure over /proc/mounts text: which mounts the index covers. */
-export function mountView(procMounts: string): MountView {
-  const virtualish = new Set(PRUNE_FS);
-  const view: MountView = { indexed: [], skipped: [] };
-  for (const line of procMounts.split("\n")) {
-    const [, rawPath, fs] = line.split(" ");
-    if (!rawPath || !fs) continue;
-    const path = rawPath.replace(/\\(\d{3})/g, (_, o: string) => String.fromCharCode(parseInt(o, 8)));
-    const prunedPath = PRUNE_PATHS.some((p) => path === p || path.startsWith(p + "/"));
-    if (prunedPath) continue;
-    if (virtualish.has(fs)) {
-      // Kernel views are noise; network and FUSE drives are worth naming.
-      if (/^(nfs|nfs4|cifs|smb3|9p|fuse\.)/.test(fs)) view.skipped.push({ path, fs });
-      continue;
-    }
-    view.indexed.push({ path, fs });
-  }
-  return view;
-}
-
 /**
  * Answer one verb. Returns undefined to hand `link` back to cli.ts, which
  * plans and applies with candidates from `linuxDupes`.
@@ -109,19 +87,37 @@ export async function runLinux(cmd: string, f: MacFlags, ctx: LinuxContext): Pro
       return undefined;
 
     case "index": {
-      ctx.err(`-- building ${locate.db} (the first run reads every disk; later runs reread changed folders only)`);
-      const r = await locate.build();
-      const count = (await locate.paths({ patterns: ["/"], basename: false, ignoreCase: false, regex: false })).length;
-      ctx.out(json ? JSON.stringify({ db: locate.db, ms: r.ms, entries: count }) : `-- indexed ${count.toLocaleString()} entries in ${duration(r.ms)} into ${locate.db}.`);
+      if (!quiet) ctx.err(`-- names: updatedb into ${locate.db} (the first run reads every disk; later runs reread changed folders only)`);
+      const names = await locate.build();
+      const counted = await run(["plocate", "-d", locate.db, "-c", "/"]);
+      const entries = Number(new TextDecoder().decode(counted.stdout).trim()) || 0;
+
+      const plan = mountPlan(readFileSync("/proc/self/mountinfo", "utf8"));
+      const roots = plan.indexed.map((m) => m.path);
+      if (!quiet) ctx.err(`-- sizes: walking ${roots.join(", ")}`);
+      const start = Date.now();
+      const acc = new SizeAccumulator();
+      await walk(roots, [...PRUNE_PATHS, ...plan.prune], acc);
+      const sizesPath = ctx.sizesDb ?? defaultSizesDb();
+      saveSizes(sizesPath, acc);
+      const sizesMs = Date.now() - start;
+
+      if (json) ctx.out(JSON.stringify({ names: { db: locate.db, ms: names.ms, entries }, sizes: { db: sizesPath, ms: sizesMs, folders: acc.dirs.size, files: acc.files } }));
+      else {
+        ctx.out([
+          `-- names: ${entries.toLocaleString()} entries in ${duration(names.ms)} (${locate.db}).`,
+          `-- sizes: ${acc.dirs.size.toLocaleString()} folders over ${acc.files.toLocaleString()} files in ${duration(sizesMs)} (${sizesPath}).`,
+        ].join("\n"));
+      }
       return 0;
     }
 
     case "doctor": {
       const builtAt = locate.builtAt();
       const timer = await run(["systemctl", "--user", "is-active", "ev-index.timer"]).then((r) => new TextDecoder().decode(r.stdout).trim() || "unknown", () => "unknown");
-      let mounts: MountView = { indexed: [], skipped: [] };
+      let mounts: MountPlan = { indexed: [], skipped: [], prune: [] };
       try {
-        mounts = mountView(readFileSync("/proc/mounts", "utf8"));
+        mounts = mountPlan(readFileSync("/proc/self/mountinfo", "utf8"));
       } catch {
         // Not Linux, or /proc is hidden: leave the mount view empty.
       }
@@ -133,16 +129,19 @@ export async function runLinux(cmd: string, f: MacFlags, ctx: LinuxContext): Pro
       else if (now - builtAt > STALE_MS) fixes.push("the index is old: run ev index, and check the ev-index.timer user unit");
       if (timer !== "active") fixes.push("enable hourly refreshes: systemctl --user enable --now ev-index.timer");
       const ok = Boolean(plocate && updatedb && builtAt !== null);
-      const report = { ok, backend: "locate", db: locate.db, builtAt: builtAt === null ? null : new Date(builtAt).toISOString(), plocate, updatedb, timer, mounts, fixes };
+      const sizesPath = ctx.sizesDb ?? defaultSizesDb();
+      const sizesAt = existsSync(sizesPath) ? statSync(sizesPath).mtimeMs : null;
+      const report = { ok, backend: "locate", db: locate.db, builtAt: builtAt === null ? null : new Date(builtAt).toISOString(), sizes: sizesPath, sizesBuiltAt: sizesAt === null ? null : new Date(sizesAt).toISOString(), plocate, updatedb, timer, mounts, fixes };
       if (json) ctx.out(JSON.stringify(report, null, 2));
       else {
         ctx.out([
           ok ? "ev: ok (Linux, plocate backend)" : "ev: not ready (Linux, plocate backend)",
           `  plocate:  ${plocate ?? "missing"}`,
           `  index:    ${locate.db}${builtAt === null ? "  (not built)" : `  (built ${duration(now - builtAt)} ago)`}`,
+          `  sizes:    ${sizesPath}${sizesAt === null ? "  (not built: du adds up files at query time)" : `  (built ${duration(now - sizesAt)} ago)`}`,
           `  refresh:  ev-index.timer ${timer}`,
           `  indexed:  ${mounts.indexed.map((m) => `${m.path} (${m.fs})`).join(", ") || "(unknown)"}`,
-          ...(mounts.skipped.length ? [`  skipped:  ${mounts.skipped.map((m) => `${m.path} (${m.fs})`).join(", ")}`] : []),
+          ...mounts.skipped.map((m) => `  skipped:  ${m.path} (${m.fs}): ${m.why}`),
           ...fixes.map((x) => `  fix: ${x}`),
         ].join("\n"));
       }
@@ -153,8 +152,26 @@ export async function runLinux(cmd: string, f: MacFlags, ctx: LinuxContext): Pro
       const path = f.positional[0];
       if (!path) throw new Error("ev du needs a path, e.g. 'ev du /mnt/shared'");
       const root = linuxDir(path, "ev du");
-      const c = await collect(locate, { terms: [], under: root }, { cap, now });
       const depth = ctx.intFlag(f, "--depth", 1);
+      const sizes = openSizes(ctx.sizesDb ?? defaultSizesDb());
+      if (sizes?.total(root)) {
+        try {
+          if (depth > 1) {
+            const t = cachedDuTree(sizes, root, depth, ctx.intFlag(f, "-n", 12));
+            ctx.out(json ? JSON.stringify(t, null, 2) : renderDuTree(t));
+          } else {
+            const r = cachedDu(sizes, root, ctx.intFlag(f, "-n", 40));
+            ctx.out(json ? JSON.stringify(r, null, 2) : renderDu(r));
+          }
+          if (!json && now - sizes.builtAt > STALE_MS) say([`-- Folder totals come from the index built ${duration(now - sizes.builtAt)} ago; loose files are current. 'ev index' refreshes it.`]);
+        } finally {
+          sizes.close();
+        }
+        return 0;
+      }
+      sizes?.close();
+      // Not in the size cache (built before this folder existed, or no cache yet): add up its files now.
+      const c = await collect(locate, { terms: [], under: root }, { cap, now });
       if (depth > 1) {
         const t = toDuTree(c.rows, root, depth, ctx.intFlag(f, "-n", 12));
         ctx.out(json ? JSON.stringify(t, null, 2) : renderDuTree(t));
