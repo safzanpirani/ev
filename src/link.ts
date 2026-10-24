@@ -86,8 +86,12 @@ const DENIED_EXTS = [
 
 const DENIED_NAMES = ["pagefile.sys", "hiberfil.sys", "swapfile.sys", "ntuser.dat", "desktop.ini", "thumbs.db"];
 
+/** Linux system trees: package-managed, live state, or not files at all. Btrfs snapshots are read-only history. */
+const DENIED_LINUX_ROOTS = ["/usr", "/etc", "/boot", "/proc", "/sys", "/dev", "/run", "/.snapshots", "/var/lib", "/var/log", "/var/cache", "/var/spool"];
+
 /** Pure. Exported so the policy is testable without touching a disk. */
 export function isLinkable(path: string): boolean {
+  if (DENIED_LINUX_ROOTS.some((d) => path === d || path.startsWith(d + "/"))) return false;
   const p = path.replaceAll("/", "\\").toLowerCase();
   if (DENIED_DIRS.some((d) => p.includes(d))) return false;
   const slash = p.lastIndexOf("\\");

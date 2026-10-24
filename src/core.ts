@@ -73,9 +73,10 @@ export interface DuTreeResult {
   minShare: number;
 }
 
+/** The last path component, for Windows (\) and Linux (/) paths alike. */
 function leafName(p: string): string {
-  const trimmed = p.replace(/\\+$/, "");
-  const i = trimmed.lastIndexOf("\\");
+  const trimmed = p.replace(/[\\/]+$/, "");
+  const i = Math.max(trimmed.lastIndexOf("\\"), trimmed.lastIndexOf("/"));
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
@@ -189,51 +190,65 @@ export async function dupes(
     return { rows, total, sampled: total > rows.length };
   }));
 
-  const seen = new Set<string>();
-  const acc = new Map<string, { name: string; size: number; paths: string[] }>();
-  for (const r of parts.flatMap((p) => p.rows)) {
-    const size = r.size ?? 0;
-    if (size <= 0 || seen.has(r.filename.toLowerCase())) continue;
-    seen.add(r.filename.toLowerCase());
-    const name = leafName(r.filename).toLowerCase();
-    const key = `${name} ${size}`;
-    const cur = acc.get(key) ?? { name: leafName(r.filename), size, paths: [] };
-    cur.paths.push(r.filename);
-    acc.set(key, cur);
-  }
-
-  const candidates = [...acc.values()].filter((g) => g.paths.length >= 2);
+  const candidates = nameSizeGroups(parts.flatMap((p) => p.rows));
 
   // Everything sees names, not inodes, so a hard-linked library looks like a
   // full copy. Stat the candidates and count each file once.
-  const ids = new Map<string, string>();
+  let ids: Map<string, string> | undefined;
   if (identify) {
+    ids = new Map();
     const paths = candidates.flatMap((g) => g.paths);
     for (let i = 0; i < paths.length; i += 64) {
       const batch = paths.slice(i, i + 64);
       const got = await Promise.all(batch.map(identify));
-      batch.forEach((p, j) => ids.set(p, got[j] ?? `unreadable:${p}`));
+      batch.forEach((p, j) => ids!.set(p, got[j] ?? `unreadable:${p}`));
     }
   }
 
-  const groups: DupeGroup[] = [];
-  let linkedTotal = 0;
-  for (const g of candidates) {
-    const distinct = identify ? new Set(g.paths.map((p) => ids.get(p)!)).size : g.paths.length;
-    const linked = g.paths.length - distinct;
-    linkedTotal += g.size * linked;
-    if (distinct < 2) continue;
-    groups.push({ name: g.name, size: g.size, paths: g.paths, wasted: g.size * (distinct - 1), ...(identify ? { linked } : {}) });
-  }
-  groups.sort((a, b) => b.wasted - a.wasted);
   return {
-    ...(identify ? { linkedTotal } : {}),
-    groups,
+    ...foldDupes(candidates, ids),
     scanned: parts.reduce((n, p) => n + p.rows.length, 0),
     total: parts.reduce((n, p) => n + p.total, 0),
     sampled: parts.some((p) => p.sampled),
-    wastedTotal: groups.reduce((s, g) => s + g.wasted, 0),
   };
+}
+
+/** Pure: same-name (case-insensitive), same-size files with at least two paths. */
+export function nameSizeGroups(rows: Array<{ filename: string; size?: number }>): Array<{ name: string; size: number; paths: string[] }> {
+  const seen = new Set<string>();
+  const acc = new Map<string, { name: string; size: number; paths: string[] }>();
+  for (const r of rows) {
+    const size = r.size ?? 0;
+    if (size <= 0 || seen.has(r.filename.toLowerCase())) continue;
+    seen.add(r.filename.toLowerCase());
+    const name = leafName(r.filename);
+    const key = `${name.toLowerCase()} ${size}`;
+    const cur = acc.get(key) ?? { name, size, paths: [] };
+    cur.paths.push(r.filename);
+    acc.set(key, cur);
+  }
+  return [...acc.values()].filter((g) => g.paths.length >= 2);
+}
+
+/**
+ * Pure: fold paths that share a file identity (hard links) and rank by
+ * reclaimable bytes. Without `ids`, every path counts as its own copy.
+ */
+export function foldDupes(
+  candidates: Array<{ name: string; size: number; paths: string[] }>,
+  ids?: Map<string, string>,
+): Pick<DupesResult, "groups" | "wastedTotal" | "linkedTotal"> {
+  const groups: DupeGroup[] = [];
+  let linkedTotal = 0;
+  for (const g of candidates) {
+    const distinct = ids ? new Set(g.paths.map((p) => ids.get(p) ?? `unreadable:${p}`)).size : g.paths.length;
+    const linked = g.paths.length - distinct;
+    linkedTotal += g.size * linked;
+    if (distinct < 2) continue;
+    groups.push({ name: g.name, size: g.size, paths: g.paths, wasted: g.size * (distinct - 1), ...(ids ? { linked } : {}) });
+  }
+  groups.sort((a, b) => b.wasted - a.wasted);
+  return { ...(ids ? { linkedTotal } : {}), groups, wastedTotal: groups.reduce((s, g) => s + g.wasted, 0) };
 }
 
 export interface DoctorReport {

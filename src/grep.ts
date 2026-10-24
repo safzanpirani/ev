@@ -41,6 +41,8 @@ export interface MainGrepResult {
   capped: boolean;
   shown: number;
   offset: number;
+  /** Which index named the candidates, for the summary line. */
+  index: string;
 }
 
 export interface GrepOptions {
@@ -67,12 +69,6 @@ export async function grepMain(
   pattern: { literal?: string; regex?: string },
   opts: GrepOptions,
 ): Promise<MainGrepResult> {
-  const test = matcher(pattern, spec.matchCase ?? false);
-  const offset = spec.offset ?? 0;
-  const want = offset + (spec.limit ?? 50);
-  const read = opts.read ?? readFromDisk;
-  const concurrency = opts.concurrency ?? 16;
-
   const base: QuerySpec = {
     ...spec,
     type: "files",
@@ -100,6 +96,23 @@ export async function grepMain(
     if (!opts.allDirs && lowerSkips.some((d) => r.filename.toLowerCase().includes(d))) skippedDirs++;
     else paths.push(r.filename);
   }
+
+  return readCandidates(paths, { candidates, capped: candidates > rows.length, skippedDirs, index: "the Everything index" }, spec, pattern, opts);
+}
+
+/** Read candidate files in order and keep the ones with matching lines. Shared by every backend. */
+export async function readCandidates(
+  paths: string[],
+  listing: Pick<MainGrepResult, "candidates" | "capped" | "skippedDirs" | "index">,
+  spec: QuerySpec,
+  pattern: { literal?: string; regex?: string },
+  opts: GrepOptions,
+): Promise<MainGrepResult> {
+  const test = matcher(pattern, spec.matchCase ?? false);
+  const offset = spec.offset ?? 0;
+  const want = offset + (spec.limit ?? 50);
+  const read = opts.read ?? readFromDisk;
+  const concurrency = opts.concurrency ?? 16;
 
   const files: FsGrepFile[] = [];
   let readCount = 0;
@@ -134,14 +147,12 @@ export async function grepMain(
 
   const shownFiles = files.slice(offset, want);
   return {
+    ...listing,
     files: shownFiles,
-    candidates,
     read: readCount,
-    skippedDirs,
     binary,
     unreadable,
     complete: next >= paths.length,
-    capped: candidates > rows.length,
     shown: shownFiles.length,
     offset,
   };
@@ -150,7 +161,7 @@ export async function grepMain(
 /** The summary, then one `-- ` line per caveat, as dupes prints its footers. */
 export function mainGrepSummary(r: MainGrepResult, cap: number): string {
   const files = `${r.shown.toLocaleString()} file${r.shown === 1 ? "" : "s"} with matches`;
-  const work = `read ${r.read.toLocaleString()} of ${r.candidates.toLocaleString()} candidate files (under ${GREP_MAX_BYTES / 1024 ** 2}M) named by the Everything index`;
+  const work = `read ${r.read.toLocaleString()} of ${r.candidates.toLocaleString()} candidate files (under ${GREP_MAX_BYTES / 1024 ** 2}M) named by ${r.index}`;
   const notes = [
     !r.complete ? "Stopped once -n files matched. Raise -n or page with --offset for more." : "",
     r.capped ? `Only the first ${cap.toLocaleString()} candidates by path were eligible. Narrow with --under/--ext or raise --cap.` : "",

@@ -13,6 +13,8 @@ import { createJournalWriter } from "./journal.ts";
 import { selectBackend, runFsearch, runFsearchRaw, LINK_ON_MAC } from "./maccli.ts";
 import { grepMain, mainGrepSummary } from "./grep.ts";
 import { renderGrepLines } from "./macrender.ts";
+import { runLinux, runLocateRaw, linuxDupes, linuxDir, STAT_CAP } from "./linuxcli.ts";
+import { makeLocate } from "./locate.ts";
 
 const HELP = `ev — file search over Everything's index
 
@@ -34,8 +36,9 @@ COMMANDS
   dupes [query...]    same-name same-size candidates, most reclaimable first
   link [query...]     replace verified duplicates with hard links (dry run)
   recent [query...]   most recently modified matches
-  raw <args...>       pass arguments straight through to es.exe
-  doctor              check that Everything is reachable
+  raw <args...>       pass arguments straight through to es.exe (plocate on Linux)
+  doctor              check that the index is reachable and fresh
+  index               Linux: rebuild ev's plocate index now
 
 QUERY OPTIONS
   --ext a,b,c         restrict to extensions
@@ -96,6 +99,16 @@ MACOS
   query words are fsearch syntax: fuzzy, typo-tolerant, 'exact, ^prefix,
   suffix$, !exclude. grep:, regex: and sym: words use content-search output
   (also content: and symbol: aliases); content queries require find, no --sort.
+
+LINUX
+  On Linux, plocate names the matches from ev's own index and lstat supplies
+  sizes and dates, so sizes are current and names are as fresh as the last
+  'ev index' (an hourly ev-index.timer keeps it fresh; listings say when it is
+  over 2h old). Every verb works. du and ext add up the files under the path
+  at query time, and hard links count once. Query words are substrings or
+  globs matched against names, !word excludes; Everything syntax words such as
+  size: or dm: refuse, so use the flags. --cap (default 2000000) bounds how many
+  index entries one query reads. Override the index path with $EV_LOCATE_DB.
 
 CONFIG
   Defaults need no config file. Override with $EV_ES_PATH, $EV_INSTANCE,
@@ -343,7 +356,7 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  const KNOWN = new Set(["find", "count", "size", "du", "big", "ext", "dupes", "recent", "raw", "doctor", "link"]);
+  const KNOWN = new Set(["find", "count", "size", "du", "big", "ext", "dupes", "recent", "raw", "doctor", "link", "index"]);
   const cmd = KNOWN.has(argv[0]!) ? argv[0]! : "find";
   const rest = KNOWN.has(argv[0]!) ? argv.slice(1) : argv;
 
@@ -352,8 +365,10 @@ async function main(argv: string[]): Promise<number> {
   const es = makeClient(cfg.esPath, cfg.instance);
   const backend = selectBackend(process.platform, process.env);
 
+  if (cmd === "index" && backend !== "locate") throw new Error("ev index builds the Linux name index; Everything on main and fsearch on the Mac keep their own");
   if (cmd === "raw") {
     if (backend === "fsearch") return runFsearchRaw(rest, { out });
+    if (backend === "locate") return runLocateRaw(rest, { out, err: (s) => process.stderr.write(s + "\n") });
     out((await es.raw(rest)).trimEnd());
     return 0;
   }
@@ -378,6 +393,11 @@ async function main(argv: string[]): Promise<number> {
     if (code !== undefined) return code;
   }
 
+  if (backend === "locate") {
+    const err = (s: string) => process.stderr.write(s + "\n");
+    const code = await runLinux(cmd, f, { buildSpec, intFlag, roots, printListing, out, err, defaultLimit: DEFAULTS.limit });
+    if (code !== undefined) return code;
+  }
   // es from here on.
   if (PATH_VERBS.has(cmd) && f.positional[0]) {
     f.positional[0] = driveRoot(f.positional[0]);
@@ -466,12 +486,13 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
     } else {
-      const cap = intFlag(f, "--cap", 50_000);
+      const cap = intFlag(f, "--cap", backend === "locate" ? STAT_CAP : 50_000);
       const minSize = f.str.get("--larger") ? parseSize(f.str.get("--larger")!) : 1024 * 1024;
       const spec = buildSpec(f, f.positional, cap);
       if (backend === "fsearch") throw new Error(LINK_ON_MAC);
-      const candidates = await dupes(es, spec, cap, roots(f));
-      plan = await planLinks(candidates.groups, fsDeps, { minSize, keep: f.multi.get("--keep") ?? [], onProgress: progress });
+      const candidates = backend === "locate" ? await linuxDupes(makeLocate(), spec, roots(f), cap, Date.now()) : await dupes(es, spec, cap, roots(f));
+      const keep = (f.multi.get("--keep") ?? []).map((k) => (backend === "locate" ? linuxDir(k, "--keep") : k));
+      plan = await planLinks(candidates.groups, fsDeps, { minSize, keep, onProgress: progress });
 
       const savePath = f.str.get("--save-plan");
       if (savePath) {

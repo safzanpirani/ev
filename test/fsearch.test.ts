@@ -328,11 +328,12 @@ describe("doctor", () => {
 });
 
 describe("backend selection", () => {
-  test("darwin uses fsearch, everything else keeps es, and $EV_BACKEND overrides", () => {
+  test("darwin uses fsearch, linux uses plocate, Windows keeps es, and $EV_BACKEND overrides", () => {
     expect(selectBackend("darwin", {})).toBe("fsearch");
     expect(selectBackend("win32", {})).toBe("es");
-    expect(selectBackend("linux", {})).toBe("es");
+    expect(selectBackend("linux", {})).toBe("locate");
     expect(selectBackend("darwin", { EV_BACKEND: "es" })).toBe("es");
+    expect(selectBackend("darwin", { EV_BACKEND: "locate" })).toBe("locate");
     expect(() => selectBackend("darwin", { EV_BACKEND: "mdfind" })).toThrow(/EV_BACKEND/);
   });
 

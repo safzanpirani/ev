@@ -141,7 +141,7 @@ export function renderLinkPlan(
   return lines.join("\n");
 }
 
-function duration(ms: number): string {
+export function duration(ms: number): string {
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;

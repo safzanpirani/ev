@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh ev's plocate index
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ev index -q
+Nice=19
+IOSchedulingClass=idle

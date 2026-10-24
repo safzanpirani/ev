@@ -11,14 +11,14 @@ import { defaultTransport, fsearchPaths, makeFsearchClient, probeTransport, read
 import { byExtension, count, doctor, find, grep, totalSize } from "./mac.ts";
 import { grepSummaryLine, macSummaryLine, renderGrepLines, renderMacDoctor, renderMacExt, renderMacRows } from "./macrender.ts";
 
-export type Backend = "es" | "fsearch";
+export type Backend = "es" | "fsearch" | "locate";
 
-/** darwin uses fsearch; everything else keeps es.exe. $EV_BACKEND overrides. */
+/** darwin uses fsearch, linux uses plocate, Windows keeps es.exe. $EV_BACKEND overrides. */
 export function selectBackend(platform: string, env: NodeJS.ProcessEnv): Backend {
   const forced = env["EV_BACKEND"];
-  if (forced === "es" || forced === "fsearch") return forced;
-  if (forced) throw new Error(`$EV_BACKEND must be es or fsearch (got ${JSON.stringify(forced)})`);
-  return platform === "darwin" ? "fsearch" : "es";
+  if (forced === "es" || forced === "fsearch" || forced === "locate") return forced;
+  if (forced) throw new Error(`$EV_BACKEND must be es, fsearch or locate (got ${JSON.stringify(forced)})`);
+  return platform === "darwin" ? "fsearch" : platform === "linux" ? "locate" : "es";
 }
 
 export const DU_ON_MAC =
