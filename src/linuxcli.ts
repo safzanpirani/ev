@@ -6,7 +6,7 @@ import type { QuerySpec, SortKey } from "./query.ts";
 import { duration, humanSize, renderDu, renderDuTree, renderDupes, renderExt } from "./render.ts";
 import { renderGrepLines } from "./macrender.ts";
 import { mainGrepSummary } from "./grep.ts";
-import { makeLocate, defaultRun, mountPlan, PRUNE_PATHS, type LocateClient, type MountPlan, type Run } from "./locate.ts";
+import { makeLocate, defaultRun, mountPlan, currentMountPlan, PRUNE_PATHS, type LocateClient, type MountPlan, type Run } from "./locate.ts";
 import { SizeAccumulator, cachedDu, cachedDuTree, defaultSizesDb, openSizes, saveSizes, walk } from "./sizes.ts";
 import { collect, grepLinux, toDu, toDuTree, toDupes, toExt, toFind, type Collected, type LxFindResult } from "./linux.ts";
 import type { DupesResult } from "./core.ts";
@@ -92,7 +92,7 @@ export async function runLinux(cmd: string, f: MacFlags, ctx: LinuxContext): Pro
       const counted = await run(["plocate", "-d", locate.db, "-c", "/"]);
       const entries = Number(new TextDecoder().decode(counted.stdout).trim()) || 0;
 
-      const plan = mountPlan(readFileSync("/proc/self/mountinfo", "utf8"));
+      const plan = currentMountPlan();
       const roots = plan.indexed.map((m) => m.path);
       if (!quiet) ctx.err(`-- sizes: walking ${roots.join(", ")}`);
       const start = Date.now();

@@ -8,7 +8,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 
 export interface RunResult {
   code: number;
@@ -99,6 +99,52 @@ export function mountPlan(mountinfo: string): MountPlan {
   return plan;
 }
 
+/** The block device an fstab source names, as a path that exists only while the disk is attached. */
+function fstabDevice(spec: string): string | null {
+  const tagged = /^(UUID|LABEL|PARTUUID|PARTLABEL)=(.+)$/.exec(spec);
+  if (tagged) return `/dev/disk/by-${tagged[1]!.toLowerCase()}/${tagged[2]}`;
+  return spec.startsWith("/dev/") ? spec : null;
+}
+
+/**
+ * Pure: systemd automounts with nothing mounted yet whose disk is attached. After a boot no NTFS
+ * drive is mounted until something opens it, so they would all be pruned; opening these first
+ * gets them indexed, while an absent disk (which would stall the walk for 90 s) stays pruned.
+ */
+export function automountsToWake(mountinfo: string, fstab: string, exists: (path: string) => boolean): string[] {
+  const plan = mountPlan(mountinfo);
+  const sleeping = new Set(plan.skipped.filter((s) => s.fs === "autofs").map((s) => s.path));
+  const wake: string[] = [];
+  for (const line of fstab.split("\n")) {
+    const [spec, path, , options] = line.trim().split(/\s+/);
+    if (!spec || spec.startsWith("#") || !path || !sleeping.has(unescape(path))) continue;
+    if (!options?.split(",").includes("x-systemd.automount")) continue;
+    const device = fstabDevice(spec);
+    if (device && exists(device)) wake.push(unescape(path));
+  }
+  return wake;
+}
+
+/** Mount what is attached, then plan from the mount table as it is now. */
+export function currentMountPlan(): MountPlan {
+  try {
+    let mountinfo = readFileSync("/proc/self/mountinfo", "utf8");
+    const wake = automountsToWake(mountinfo, readFileSync("/etc/fstab", "utf8"), existsSync);
+    for (const path of wake) {
+      try {
+        readdirSync(path);
+      } catch {
+        // A mount that fails stays an empty automount and is pruned below.
+      }
+    }
+    if (wake.length) mountinfo = readFileSync("/proc/self/mountinfo", "utf8");
+    return mountPlan(mountinfo);
+  } catch {
+    // No mountinfo or fstab: the static prune lists still apply.
+    return { indexed: [], skipped: [], prune: [] };
+  }
+}
+
 export interface PathQuery {
   patterns: string[];
   basename: boolean;
@@ -137,12 +183,7 @@ export function makeLocate(db: string = defaultDb(), run: Run = defaultRun): Loc
     async build() {
       mkdirSync(join(db, ".."), { recursive: true });
       const start = Date.now();
-      let plan: MountPlan = { indexed: [], skipped: [], prune: [] };
-      try {
-        plan = mountPlan(readFileSync("/proc/self/mountinfo", "utf8"));
-      } catch {
-        // No mountinfo: fall back to the static prune list.
-      }
+      const plan = currentMountPlan();
       const argv = [
         "updatedb", "-l", "0", "-U", "/", "-o", db,
         "--prunefs", PRUNE_FS.join(" "),

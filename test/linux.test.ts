@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { collect, planQueries, toDu, toDuTree, toDupes, toFind, type LxRow } from "../src/linux.ts";
 import { linuxNotes } from "../src/linuxcli.ts";
-import { mountPlan, type LocateClient, type PathQuery } from "../src/locate.ts";
+import { automountsToWake, mountPlan, type LocateClient, type PathQuery } from "../src/locate.ts";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
 
@@ -142,4 +142,24 @@ test("the mount plan indexes subvolumes and mounted automounts, prunes binds and
   expect(p.indexed.map((m) => m.path)).toEqual(["/", "/home", "/mnt/shared", "/mnt/windows-c", "/mnt/My Drive"]);
   expect(p.prune).toEqual(["/var/lib/jellyfin", "/mnt/nvme-500gb"]);
   expect(p.skipped.map((m) => m.why)).toEqual(["bind mount of /mnt/shared", "automount with nothing mounted", "network or FUSE drive"]);
+});
+
+// Seen 2026-10-24 right after a boot: the hourly index ran before anything had opened the NTFS drives,
+// so every automount was empty and pruned, and the index lost three drives.
+test("attached disks behind empty automounts are woken; an absent disk is left alone", () => {
+  const mountinfo = [
+    "33 2 0:30 /@ / rw - btrfs /dev/nvme0n1p9 rw",
+    "57 33 0:51 / /mnt/data-750gb rw - autofs systemd-1 rw,direct",
+    "63 33 0:53 / /mnt/nvme-500gb rw - autofs systemd-1 rw,direct",
+    "66 33 0:54 / /mnt/windows-c rw - autofs systemd-1 rw,direct",
+    "426 66 259:2 / /mnt/windows-c rw - fuseblk /dev/nvme0n1p2 rw",
+  ].join("\n");
+  const fstab = [
+    "# comment",
+    "UUID=AAA639A7A6397543 /mnt/windows-c ntfs-3g uid=1000,x-systemd.automount 0 0",
+    "UUID=2EC8AC85C8AC4D41 /mnt/data-750gb ntfs-3g uid=1000,nofail,x-systemd.automount 0 0",
+    "UUID=C84E16C64E16ACE6 /mnt/nvme-500gb ntfs-3g uid=1000,nofail,x-systemd.automount 0 0",
+  ].join("\n");
+  const attached = new Set(["/dev/disk/by-uuid/AAA639A7A6397543", "/dev/disk/by-uuid/2EC8AC85C8AC4D41"]);
+  expect(automountsToWake(mountinfo, fstab, (p) => attached.has(p))).toEqual(["/mnt/data-750gb"]);
 });
