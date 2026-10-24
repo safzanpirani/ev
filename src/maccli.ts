@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { realpathSync } from "node:fs";
 import type { QuerySpec, SortKey } from "./query.ts";
 import { buildFsQuery, isFsContentQuery } from "./fsquery.ts";
-import { humanSize } from "./render.ts";
+import { humanSize, renderRows } from "./render.ts";
 import { defaultTransport, fsearchPaths, makeFsearchClient, probeTransport, readDaemonFacts, type FsearchClient } from "./fsearch.ts";
 import { byExtension, count, doctor, find, grep, totalSize } from "./mac.ts";
 import { grepSummaryLine, macSummaryLine, renderGrepLines, renderMacDoctor, renderMacExt, renderMacRows } from "./macrender.ts";
@@ -157,7 +157,7 @@ export async function runFsearch(cmd: string, f: MacFlags, ctx: MacContext): Pro
       ctx.out(JSON.stringify(r, null, 2));
       return 0;
     }
-    ctx.out(renderGrepLines(r));
+    ctx.out(f.bool.has("--paths") ? r.files.map((x) => x.path).join("\n") : renderGrepLines(r));
     if (!quiet) ctx.err(grepSummaryLine(r));
     return 0;
   }
@@ -167,8 +167,9 @@ export async function runFsearch(cmd: string, f: MacFlags, ctx: MacContext): Pro
     ctx.out(JSON.stringify(r, null, 2));
     return 0;
   }
-  ctx.out(renderMacRows(r, { showDate: f.bool.has("--date") || cmd === "recent" }));
-  // Same streams as the es path: big prints its summary on stdout, find and recent on stderr.
-  if (!quiet) (cmd === "big" ? ctx.out : ctx.err)(macSummaryLine(r));
+  // Same streams as the es path: the summary follows the rows on stdout, or goes to stderr under --paths.
+  const paths = f.bool.has("--paths");
+  ctx.out(paths ? renderRows(r.rows) : renderMacRows(r, { showDate: f.bool.has("--date") || cmd === "recent" }));
+  if (!quiet) (paths ? ctx.err : ctx.out)(macSummaryLine(r));
   return 0;
 }

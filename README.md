@@ -201,12 +201,30 @@ known names on Error 8 so an Everything upgrade does not break every command.
 **Search terms must be separate argv tokens.** ES joins multiple non-switch
 arguments into one search, but a single argument containing spaces is treated as
 one literal phrase. `es -get-result-count "ext:mkv size:>1gb"` matched 0 files;
-the same two terms as separate arguments matched 578.
+the same two terms as separate arguments matched 578. A token that carries its
+own quote characters also matches nothing, because the Windows command line
+escapes those quotes as `\"` before ES reads them.
+
+`ev` splits each query argument on whitespace, so `ev find "walking dead"` and
+`ev find walking dead` both search for two words that must each appear in the
+name, as Everything's search box does. A double-quoted run inside an argument,
+as in `ev find '"red dead" ext:exe'`, stays one phrase and is passed without its
+quotes, which ES reads as a phrase. Dates follow the same rule:
+`--after "2026-10-23 10:00"` becomes `dm:>=2026-10-23T10:00`.
 
 ## Behaviour worth knowing
 
-- **stdout is data, stderr is diagnostics.** The trailing summary line goes to
-  stderr so `ev find … > out.txt` stays clean. `-q` silences it.
+- **The summary line follows the rows on stdout.** Several `ev` calls batched
+  into one `fleet exec` then keep each footer under its own rows; on stderr the
+  footers all arrived after the last command. `--paths` prints bare paths for
+  piping and moves the summary to stderr. `-q` drops it.
+- **A missing folder is an error.** `ev du`, `ev big`, `ev ext`, `--under`,
+  `--parent` and `--keep` refuse a path that does not exist, where Everything
+  would answer 0B and 0 matches. A bare drive letter such as `C:` means the
+  drive root; Windows would read it as the current folder on that drive.
+- **Common flag guesses work.** `--limit` is `-n`, `--name=value` equals
+  `--name value`, and an unknown flag names the one you probably meant
+  (`--size` points at `--larger`, `--smaller` and `ev size`).
 - **Totals are always true.** A capped listing still reports the real match count
   and total size, so a caller never mistakes the first 50 rows for the whole set.
   `du` totals include all indexed files regardless of `-n` or depth. If Everything

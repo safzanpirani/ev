@@ -43,11 +43,6 @@ describe("query building", () => {
     expect(args.some((a) => a.includes(" "))).toBe(false);
   });
 
-  test("a multi-word user term stays one token, quoted as an Everything phrase", () => {
-    expect(buildSearchTokens({ terms: ["black myth"] })).toEqual(['"black myth"']);
-    expect(buildSearchTokens({ terms: ['"already quoted"'] })).toEqual(['"already quoted"']);
-  });
-
   test("path and type filters are switches, not search terms", () => {
     // parent:/folder: as query terms silently return nothing; ES wants -parent and /ad.
     const args = buildArgs({ terms: [], parent: "F:\\", type: "folders", sort: "size", limit: 5 }, ["-size"]);
@@ -64,9 +59,22 @@ describe("query building", () => {
     expect(args).not.toContain("-n");
   });
 
-  test("terms and filters stay separate tokens", () => {
-    const args = buildArgs({ terms: ["black myth"], ext: ["exe"] }, []);
-    expect(args).toEqual(['"black myth"', "ext:exe"]);
+  // Pinned from a real ES probe on 2026-10-24: a token carrying its own quotes
+  // reaches es.exe as \"red dead\" and matched 0, while "red dead" as one plain
+  // token matched as a phrase and red + dead as two tokens matched as AND.
+  test("one argument with spaces becomes separate words, as in Everything's search box", () => {
+    expect(buildArgs({ terms: ["walking dead"], ext: ["srt"] }, [])).toEqual(["walking", "dead", "ext:srt"]);
+    expect(buildSearchTokens({ terms: ["size:>500mb dm:today"] })).toEqual(["size:>500mb", "dm:today"]);
+  });
+
+  test("a double-quoted run stays one phrase token and never carries quote characters", () => {
+    expect(buildSearchTokens({ terms: ['"red dead" ext:exe'] })).toEqual(["red dead", "ext:exe"]);
+    expect(buildSearchTokens({ terms: ['"', "  "] })).toEqual([]);
+  });
+
+  test("a date with a time becomes the T form; other spaces are refused", () => {
+    expect(buildSearchTokens({ terms: [], modifiedAfter: "2026-10-23 10:00" })).toEqual(["dm:>=2026-10-23T10:00"]);
+    expect(() => buildSearchTokens({ terms: [], modifiedAfter: "last week" })).toThrow(/without spaces/);
   });
 
   test("ascending flips the sort direction", () => {

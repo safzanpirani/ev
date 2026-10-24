@@ -4,11 +4,11 @@
 import { loadConfig, DEFAULTS } from "./config.ts";
 import { makeClient, EsError } from "./es.ts";
 import { parseSize, type QuerySpec, type SortKey, type TypeFilter } from "./query.ts";
-import { find, count, totalSize, du, duTree, byExtension, dupes, doctor } from "./core.ts";
-import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, renderProgress, humanSize, summaryLine } from "./render.ts";
+import { find, count, totalSize, du, duTree, byExtension, dupes, doctor, type FindResult } from "./core.ts";
+import { renderFind, renderDu, renderExt, renderDupes, renderDuTree, renderDoctor, renderLinkPlan, renderApply, renderProgress, renderRows, humanSize, summaryLine } from "./render.ts";
 import { planLinks, applyLinks, undoLinks, parsePlan, type Journal, type LinkPlan, type Progress, type SavedPlan } from "./link.ts";
 import { makeFsDeps } from "./fsdeps.ts";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createJournalWriter } from "./journal.ts";
 import { selectBackend, runFsearch, runFsearchRaw, LINK_ON_MAC, GREP_OFF_MAC } from "./maccli.ts";
 
@@ -16,6 +16,11 @@ const HELP = `ev — file search over Everything's index
 
 USAGE
   ev <command> [options] [query...]
+
+  Query words are ANDed against file and folder names, as in Everything's
+  search box: ev find walking dead and ev find "walking dead" both match
+  The.Walking.Dead.S01E01.mkv. Keep a phrase together with inner quotes:
+  ev find '"red dead"'. Everything syntax words work too: ev find 'dm:today size:>1gb'.
 
 COMMANDS
   find [query...]     search the index (default command)
@@ -47,7 +52,9 @@ QUERY OPTIONS
   --match-path        match against the full path, not just the name
 
 OUTPUT OPTIONS
-  -n <count>          max rows (default ${DEFAULTS.limit}; ev du/ext/dupes default 40)
+  -n <count>          max rows (default ${DEFAULTS.limit}; ev du/ext/dupes default 40); --limit works too
+  --paths             find, recent, big: full paths only, one per line; the
+                      summary line moves to stderr
   --offset <n>        skip the first n results
   --sort <key>        size|name|path|modified|created|extension
   --asc               sort ascending (default is descending for size and dates)
@@ -56,7 +63,7 @@ OUTPUT OPTIONS
   --cap <n>           rows to aggregate over for ext, dupes and link (default 50000)
   --index-only        dupes: skip the stat that folds existing hard links together
   --json              emit the whole result as JSON
-  -q                  suppress the trailing summary line
+  -q                  suppress the summary line that ends every listing
 
 LINK OPTIONS
   --yes               actually create the links (without it, nothing changes)
@@ -118,8 +125,45 @@ const STR_FLAGS = new Set([
 const MULTI_FLAGS = new Set(["--under", "--keep"]);
 const BOOL_FLAGS = new Set([
   "--files", "--folders", "--regex", "--case", "--whole-word", "--match-path",
-  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick", "--index-only",
+  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick", "--index-only", "--paths",
 ]);
+/** Spellings agents reach for first, accepted as the flag they meant. */
+const ALIASES: Record<string, string> = { "--limit": "-n" };
+const UNDER_HINT = "use --under <dir> (whole subtree) or --parent <dir> (direct children)";
+/** Wrong guesses that have a right answer under another name. */
+const FLAG_HINTS: Record<string, string> = {
+  "--size": "filter with --larger/--smaller, or use 'ev size' for a total",
+  "--min-size": "use --larger",
+  "--max-size": "use --smaller",
+  "--path": UNDER_HINT,
+  "--dir": UNDER_HINT,
+  "--in": UNDER_HINT,
+  "--type": "use --files, --folders or --ext",
+  "--name": "pass name words as the query: ev find <words>",
+  "--since": "use --after",
+  "--until": "use --before",
+  "--max": "use -n",
+  "--top": "use -n",
+};
+
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+function unknownOption(name: string): Error {
+  let hint = FLAG_HINTS[name];
+  if (!hint) {
+    const near = [...STR_FLAGS, ...BOOL_FLAGS].filter((k) => k.startsWith("--") && editDistance(name, k) <= 2);
+    if (near.length) hint = `did you mean ${near.join(" or ")}?`;
+  }
+  return new Error(`unknown option ${name}${hint ? ` — ${hint}` : ""}. Run 'ev --help' for the full list.`);
+}
 
 function parseFlags(argv: string[]): Flags {
   const positional: string[] = [];
@@ -128,18 +172,23 @@ function parseFlags(argv: string[]): Flags {
   const bool = new Set<string>();
 
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
+    // --name=value and --name value are the same flag.
+    const eq = argv[i]!.startsWith("--") ? argv[i]!.indexOf("=") : -1;
+    const given = eq > 0 ? argv[i]!.slice(0, eq) : argv[i]!;
+    const inline = eq > 0 ? argv[i]!.slice(eq + 1) : undefined;
+    const a = ALIASES[given] ?? given;
     if (STR_FLAGS.has(a)) {
-      const v = argv[++i];
+      const v = inline ?? argv[++i];
       if (v === undefined) throw new Error(`${a} needs a value`);
       if (MULTI_FLAGS.has(a)) multi.set(a, [...(multi.get(a) ?? []), v]);
       else if (str.has(a)) throw new Error(`${a} was given twice`);
       str.set(a, v);
     } else if (BOOL_FLAGS.has(a)) {
+      if (inline !== undefined) throw new Error(`${a} takes no value`);
       bool.add(a);
     } else if (a.startsWith("--") || (a.startsWith("-") && a.length > 1 && !/^-\d/.test(a))) {
       // Anything left that is dash-shaped is a typo, not a positional.
-      throw new Error(`unknown option ${a} — run 'ev --help' for the full list`);
+      throw unknownOption(a);
     } else {
       positional.push(a);
     }
@@ -238,6 +287,41 @@ function out(s: string): void {
   if (s) process.stdout.write(s + "\n");
 }
 
+const PATH_VERBS = new Set(["du", "ext", "big"]);
+const LISTING_VERBS = new Set(["find", "recent", "big"]);
+
+/** Windows reads a bare "C:" as the current folder on C:, never the drive a search means. */
+function driveRoot(p: string): string {
+  return /^[A-Za-z]:$/.test(p) ? `${p}\\` : p;
+}
+
+/** A missing folder answers 0B and 0 matches, which reads as "empty". Say it is missing instead. */
+function requireDir(p: string, what: string): void {
+  if (process.platform === "win32" && !existsSync(p)) throw new Error(`${what}: '${p}' does not exist on this machine`);
+}
+
+/** Why a name search found nothing, for the summary line. */
+function emptyHint(spec: QuerySpec): string {
+  if (!spec.terms.some((t) => t.trim())) return "";
+  return spec.matchPath
+    ? " Everything matches names and paths, not file contents."
+    : " Every word must appear in the name itself, not its folders or the file's contents; try fewer words or --match-path.";
+}
+
+/**
+ * Rows, then the summary line on the same stream, so several ev calls batched in
+ * one fleet exec keep each footer under its own rows. --paths keeps stdout to
+ * bare paths and moves the summary to stderr.
+ */
+function printListing(r: FindResult, spec: QuerySpec, f: Flags, showDate: boolean): void {
+  const paths = f.bool.has("--paths");
+  out(paths ? renderRows(r.rows) : renderFind(r, { showDate }).split("\n").slice(0, -1).join("\n"));
+  if (f.bool.has("-q")) return;
+  const footer = summaryLine(r) + (r.total === 0 ? emptyHint(spec) : "");
+  if (paths) process.stderr.write(footer + "\n");
+  else out(footer);
+}
+
 async function main(argv: string[]): Promise<number> {
   if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") {
     out(HELP.trimEnd());
@@ -270,12 +354,30 @@ async function main(argv: string[]): Promise<number> {
     throw new Error(`only dupes and link accept --under more than once`);
   }
   if (cmd !== "link" && f.multi.has("--keep")) throw new Error(`--keep only applies to ev link`);
+  if (f.bool.has("--paths") && !LISTING_VERBS.has(cmd)) throw new Error(`--paths applies to find, recent and big (got ev ${cmd})`);
   if (backend !== "fsearch" && (f.str.has("--grep") || f.str.has("--grep-regex"))) throw new Error(GREP_OFF_MAC);
 
   if (backend === "fsearch") {
     const err = (s: string) => process.stderr.write(s + "\n");
     const code = await runFsearch(cmd, f, { buildSpec, intFlag, roots, out, err, defaultLimit: DEFAULTS.limit });
     if (code !== undefined) return code;
+  }
+
+  // es from here on.
+  if (PATH_VERBS.has(cmd) && f.positional[0]) {
+    f.positional[0] = driveRoot(f.positional[0]);
+    requireDir(f.positional[0], `ev ${cmd}`);
+  }
+  for (const flag of ["--under", "--keep"]) {
+    const dirs = f.multi.get(flag)?.map(driveRoot);
+    if (!dirs) continue;
+    f.multi.set(flag, dirs);
+    for (const d of dirs) requireDir(d, flag);
+  }
+  const parentDir = f.str.get("--parent");
+  if (parentDir) {
+    f.str.set("--parent", driveRoot(parentDir));
+    requireDir(driveRoot(parentDir), "--parent");
   }
 
   if (cmd === "doctor") {
@@ -312,7 +414,8 @@ async function main(argv: string[]): Promise<number> {
     spec.under = path;
     spec.type = spec.type ?? "files";
     const r = await find(es, spec);
-    out(json ? JSON.stringify(r, null, 2) : quiet ? renderFind(r).split("\n").slice(0, -1).join("\n") : renderFind(r));
+    if (json) out(JSON.stringify(r, null, 2));
+    else printListing(r, spec, f, f.bool.has("--date"));
     return 0;
   }
 
@@ -414,11 +517,7 @@ async function main(argv: string[]): Promise<number> {
     out(JSON.stringify(r, null, 2));
     return 0;
   }
-  const showDate = f.bool.has("--date") || cmd === "recent";
-  const body = renderFind(r, { showDate }).split("\n");
-  const rows = body.slice(0, -1).join("\n");
-  out(rows);
-  if (!quiet) process.stderr.write(summaryLine(r) + "\n");
+  printListing(r, spec, f, f.bool.has("--date") || cmd === "recent");
   return 0;
 }
 

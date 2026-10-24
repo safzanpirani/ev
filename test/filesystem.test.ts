@@ -83,3 +83,13 @@ test("nested --under roots are refused before Everything is queried", async () =
   expect(r.code).toBe(1);
   expect(r.stderr).toContain("give disjoint trees");
 });
+
+test("flags agents guess are accepted or pointed at the right name", async () => {
+  const wrong = await runCli(["find", "--size", "5G"]);
+  expect(wrong.code).toBe(1);
+  expect(wrong.stderr).toContain("--larger");
+  // --limit=3 parses as -n 3, so the only complaint left is --paths on du.
+  const alias = await runCli(["du", "F:\\", "--limit=3", "--paths"]);
+  expect(alias.code).toBe(1);
+  expect(alias.stderr).toContain("--paths applies to find, recent and big");
+});

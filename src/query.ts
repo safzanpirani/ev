@@ -42,9 +42,30 @@ export function parseSize(input: string): number {
   return Math.round(n * mult[unit]!);
 }
 
-/** Everything treats a bare date as a day; pass through what it already understands. */
+/**
+ * Everything treats a bare date as a day and reads 2026-10-01T10:00 as a time.
+ * A space inside the token makes ES match nothing, so "2026-10-01 10:00" becomes
+ * the T form and any other space is refused.
+ */
 function normalizeDate(input: string): string {
-  return /\s/.test(input) ? `"${input}"` : input;
+  const d = input.trim().replace(/^(\d{4}-\d{2}-\d{2})\s+(\d)/, "$1T$2");
+  if (/\s/.test(d)) throw new Error(`bad date ${JSON.stringify(input)} — use forms without spaces: 2026-10-01, 2026-10-01T10:00, today, lastweek`);
+  return d;
+}
+
+/**
+ * One user argument as Everything search words. Whitespace separates words,
+ * which Everything ANDs as its search box does, so `ev find "walking dead"`
+ * matches `The.Walking.Dead.S01E01.mkv`. A "double-quoted" run stays one word,
+ * which Everything reads as a phrase.
+ *
+ * Returned words never contain quote characters. Bun quotes an argv token that
+ * contains a space when it builds the Windows command line, and ES reads that
+ * token as a phrase. A token that already contains quotes reaches ES as \"...\"
+ * and matches nothing, which is what `ev find "red dead"` did before.
+ */
+export function queryWords(term: string): string[] {
+  return (term.match(/(?:[^\s"]+|"[^"]*")+/g) ?? []).map((w) => w.replaceAll('"', "")).filter(Boolean);
 }
 
 /**
@@ -53,14 +74,9 @@ function normalizeDate(input: string): string {
  * ES joins multiple non-switch arguments into one search, but a SINGLE argument
  * containing spaces is treated as one literal phrase. Passing "ext:mkv size:>1gb"
  * as one token matches nothing; passing them as two tokens matches correctly.
- * A user term that contains spaces is quoted so Everything reads it as a phrase.
  */
 export function buildSearchTokens(spec: QuerySpec): string[] {
-  const parts: string[] = [];
-  for (const t of spec.terms) {
-    if (!t.trim()) continue;
-    parts.push(/\s/.test(t) && !/^".*"$/.test(t) ? `"${t}"` : t);
-  }
+  const parts = spec.terms.flatMap(queryWords);
   if (spec.ext?.length) parts.push(`ext:${spec.ext.join(";")}`);
   if (spec.larger !== undefined) parts.push(`size:>=${spec.larger}`);
   if (spec.smaller !== undefined) parts.push(`size:<=${spec.smaller}`);
