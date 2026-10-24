@@ -438,10 +438,4 @@ describe("cli on each backend", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("--case is not supported on macOS");
   });
-
-  test("--grep on the es backend says it is macOS-only", async () => {
-    const r = await cli(["find", "--grep", "x"], "es");
-    expect(r.code).toBe(1);
-    expect(r.stderr).toContain("only exists on macOS");
-  });
 });

@@ -106,8 +106,9 @@ export function makeClient(exe: string, instance: string, run: Runner = defaultR
     if (!r.ok) {
       // errorlevel 9 (no results) is only set with -no-result-error; treat as empty.
       if (r.code === 9) return "";
-      const hint = ES_ERRORS[r.code];
+      let hint = ES_ERRORS[r.code];
       const detail = r.stderr.trim() || r.stdout.trim();
+      if (/Unknown attribute/i.test(detail)) hint = "es: unknown attribute. Attributes are letters right after /a with no colon: /ad folders, /a-d files, /ah hidden";
       throw new EsError(r.code, hint ? `${hint}${detail ? `\n  ${detail}` : ""}` : `es exited ${r.code}: ${detail}`);
     }
     return r.stdout;

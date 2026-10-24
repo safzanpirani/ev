@@ -76,7 +76,8 @@ export function queryWords(term: string): string[] {
  * as one token matches nothing; passing them as two tokens matches correctly.
  */
 export function buildSearchTokens(spec: QuerySpec): string[] {
-  const parts = spec.terms.flatMap(queryWords);
+  // A regex is one pattern: "red dead|walking dead" split into words would AND the pieces.
+  const parts = spec.regex ? spec.terms.filter((t) => t.trim()) : spec.terms.flatMap(queryWords);
   if (spec.ext?.length) parts.push(`ext:${spec.ext.join(";")}`);
   if (spec.larger !== undefined) parts.push(`size:>=${spec.larger}`);
   if (spec.smaller !== undefined) parts.push(`size:<=${spec.smaller}`);

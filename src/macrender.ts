@@ -26,7 +26,7 @@ export function renderMacExt(r: MacExtResult, limit: number): string {
 }
 
 /** One `path:line: text` per match, like grep -n. */
-export function renderGrepLines(r: GrepResult): string {
+export function renderGrepLines(r: Pick<GrepResult, "files">): string {
   const lines: string[] = [];
   for (const f of r.files) for (const m of f.matches) lines.push(`${f.path}:${m.line}: ${m.text.trim()}`);
   return lines.join("\n");

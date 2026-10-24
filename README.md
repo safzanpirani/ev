@@ -67,7 +67,8 @@ The next call restarts it and rescans the skipped folders.
 | Verb | On macOS |
 |---|---|
 | `find`, `recent`, `big`, `count`, `size`, `ext`, `raw`, `doctor` | work |
-| `find --grep <text>`, `--grep-regex <re>`, `find grep:…`, `regex:…`, `sym:…` | content search, macOS only |
+| `find --grep <text>`, `--grep-regex <re>` | content search from fsearch's content index (main reads candidate files instead) |
+| `find grep:…`, `regex:…`, `sym:…` | content search words, macOS only |
 | `du` | refuses: fsearch has no folder-size rollups. Use `sweep dust <dir>` |
 | `dupes` | refuses: APFS clones look like duplicates but share blocks |
 | `link` | shows saved plans and undoes; refuses to plan or apply |
@@ -99,6 +100,32 @@ What differs from Everything:
   Fsearch interprets the native pattern and mode; an explicit `--grep` or
   `--grep-regex` takes precedence. Content queries require `find`, and `--sort`
   is unsupported, just as with the content flags.
+
+## Content search on main
+
+Everything does not index file contents. `ev find --grep <text>` (or
+`--grep-regex <re>`) asks the index for candidate files and then reads them, so
+every name filter narrows the read set before any file is opened:
+
+```
+$ ev find --grep effort --under 'C:\Strata-data' -n 3
+C:\Strata-data\packs\iq3_s\tokenizer\chat_template.jinja:59: {%- set resolved_reasoning_effort = ...
+...
+-- 3 files with matches; read 96 of 96 candidate files (under 10M) named by the Everything index.
+-- 24 binary or UTF-16 files were skipped.
+```
+
+- Candidates are files under 10 MB in path order, at most `--cap` (default
+  5000). Matching ignores case unless `--case` is given.
+- Files under `node_modules`, `.git`, `site-packages`, `__pycache__`, `venv` and
+  `.venv` are excluded in the index query, so they never use up the cap.
+  `--all-dirs` reads them.
+- Files with a NUL byte in their first 8000 bytes are treated as binary and
+  skipped. That includes UTF-16 text, which Windows writes for some logs.
+- `-n` counts files with matches. Reading stops once that many matched, and the
+  footer says the answer is partial. `--paths` prints only the matching files.
+- Without `--under` or name filters the candidates are the first 5000 files on
+  the machine by path; the footer reports when the cap cut the list.
 
 ## Reclaiming space with hard links
 
@@ -152,8 +179,9 @@ $ ev link --plan plan.json            # show it again
 $ ev link --plan plan.json --yes      # apply it; every file is re-verified first
 ```
 
-Planning and applying print a progress line to stderr every few seconds, so a
-long run can go into a detached job and its log shows how far it got.
+Planning and applying print a progress line to stderr every few seconds, with
+elapsed time and a byte-based estimate of the time left, so a long run can go
+into a detached job and its log shows how far it got and when it should end.
 
 What it refuses to link, because a hard link is only safe when tools *replace* a
 file rather than *modify it in place*: databases, VM disks, logs, lock files,
@@ -174,6 +202,7 @@ render.ts   pure: data in, string out
 es.ts       the one file that owns es.exe
 fsdeps.ts   the one file that owns the filesystem
 config.ts   optional; defaults are correct on main
+grep.ts     content search on main: the index names candidates, ev reads them
 maccli.ts   macOS frontend: the same verbs, answered by fsearch
 mac.ts      macOS actions: find, count, size, ext, grep, doctor — never prints
 fsquery.ts  pure: QuerySpec in, fsearch query out; unsupported flags fail here
@@ -241,8 +270,13 @@ quotes, which ES reads as a phrase. Dates follow the same rule:
 - **An empty result set has zero bytes.** ES reports the unknown-size sentinel
   for an empty set as well as for a genuinely unknown size. `du` over a folder
   with no loose files, and `size` over no matches, report 0.
-- **Everything indexes names and metadata, never file contents.** Content search
-  is ripgrep's job.
+- **Everything indexes names and metadata, never file contents.** `ev find --grep`
+  on main bridges that: see [Content search on main](#content-search-on-main).
+- **`du --depth 2` and deeper show the largest 12 entries per folder** and leave
+  folders under 2% of their parent closed, because each expanded folder costs a
+  query. The footer says so; `-n` raises the per-folder count.
+- **`--regex` keeps the query whole.** A pattern such as `red dead|walking dead`
+  is one token; splitting it into words would AND its pieces.
 
 ## Configuration
 

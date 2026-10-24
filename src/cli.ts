@@ -10,7 +10,9 @@ import { planLinks, applyLinks, undoLinks, parsePlan, type Journal, type LinkPla
 import { makeFsDeps } from "./fsdeps.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createJournalWriter } from "./journal.ts";
-import { selectBackend, runFsearch, runFsearchRaw, LINK_ON_MAC, GREP_OFF_MAC } from "./maccli.ts";
+import { selectBackend, runFsearch, runFsearchRaw, LINK_ON_MAC } from "./maccli.ts";
+import { grepMain, mainGrepSummary } from "./grep.ts";
+import { renderGrepLines } from "./macrender.ts";
 
 const HELP = `ev — file search over Everything's index
 
@@ -51,8 +53,18 @@ QUERY OPTIONS
   --whole-word        match whole words
   --match-path        match against the full path, not just the name
 
+CONTENT SEARCH (ev find)
+  --grep <text>       lines containing this text, as path:line: text; -n counts
+                      files, --paths lists only the files
+  --grep-regex <re>   the same with a regular expression
+  --all-dirs          main: also read node_modules, .git, site-packages, venv
+  On main the index names candidate files (any name filters above, under 10M,
+  path order, --cap default 5000), ev reads them, and matching ignores case
+  unless --case. On the Mac, fsearch's content index answers.
+
 OUTPUT OPTIONS
-  -n <count>          max rows (default ${DEFAULTS.limit}; ev du/ext/dupes default 40); --limit works too
+  -n <count>          max rows (default ${DEFAULTS.limit}; ev du/ext/dupes default 40;
+                      du --depth 2+ shows 12 per folder); --limit works too
   --paths             find, recent, big: full paths only, one per line; the
                       summary line moves to stderr
   --offset <n>        skip the first n results
@@ -84,8 +96,6 @@ MACOS
   query words are fsearch syntax: fuzzy, typo-tolerant, 'exact, ^prefix,
   suffix$, !exclude. grep:, regex: and sym: words use content-search output
   (also content: and symbol: aliases); content queries require find, no --sort.
-  --grep <text>       content search (literal), with any name filters above
-  --grep-regex <re>   content search (regular expression)
 
 CONFIG
   Defaults need no config file. Override with $EV_ES_PATH, $EV_INSTANCE,
@@ -98,6 +108,7 @@ EXAMPLES
   ev dupes --under F:\\ --larger 1G
   ev big D:\\Downloads -n 20
   ev count "ext:iso"
+  ev find --grep requireDir --under C:\\Users\\Admin\\src --ext ts
   ev raw -parent "F:\\" /ad -size -sort size-descending
 
   ev link --ext safetensors,onnx --larger 100M          # plan, change nothing
@@ -125,7 +136,7 @@ const STR_FLAGS = new Set([
 const MULTI_FLAGS = new Set(["--under", "--keep"]);
 const BOOL_FLAGS = new Set([
   "--files", "--folders", "--regex", "--case", "--whole-word", "--match-path",
-  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick", "--index-only", "--paths",
+  "--asc", "--date", "--json", "-q", "-h", "--help", "--yes", "--quick", "--index-only", "--paths", "--all-dirs",
 ]);
 /** Spellings agents reach for first, accepted as the flag they meant. */
 const ALIASES: Record<string, string> = { "--limit": "-n" };
@@ -215,12 +226,15 @@ function roots(f: Flags): string[] {
 function progressWriter(quiet: boolean): ((p: Progress) => void) | undefined {
   if (quiet) return undefined;
   let last = 0;
+  let phase = "";
+  let start = 0;
   return (p) => {
     const now = Date.now();
+    if (p.phase !== phase) [phase, start] = [p.phase, now];
     const final = p.done === p.total;
     if (!final && now - last < 5000) return;
     last = now;
-    process.stderr.write(renderProgress(p) + "\n");
+    process.stderr.write(renderProgress(p, now - start) + "\n");
   };
 }
 
@@ -317,7 +331,8 @@ function printListing(r: FindResult, spec: QuerySpec, f: Flags, showDate: boolea
   const paths = f.bool.has("--paths");
   out(paths ? renderRows(r.rows) : renderFind(r, { showDate }).split("\n").slice(0, -1).join("\n"));
   if (f.bool.has("-q")) return;
-  const footer = summaryLine(r) + (r.total === 0 ? emptyHint(spec) : "");
+  const unknown = spec.type === "folders" ? "no total (matched folders can nest inside each other)" : undefined;
+  const footer = summaryLine(r, unknown) + (r.total === 0 ? emptyHint(spec) : "");
   if (paths) process.stderr.write(footer + "\n");
   else out(footer);
 }
@@ -355,7 +370,7 @@ async function main(argv: string[]): Promise<number> {
   }
   if (cmd !== "link" && f.multi.has("--keep")) throw new Error(`--keep only applies to ev link`);
   if (f.bool.has("--paths") && !LISTING_VERBS.has(cmd)) throw new Error(`--paths applies to find, recent and big (got ev ${cmd})`);
-  if (backend !== "fsearch" && (f.str.has("--grep") || f.str.has("--grep-regex"))) throw new Error(GREP_OFF_MAC);
+  if (backend === "fsearch" && f.bool.has("--all-dirs")) throw new Error("--all-dirs applies to --grep on main; fsearch's content index decides what it skips on macOS");
 
   if (backend === "fsearch") {
     const err = (s: string) => process.stderr.write(s + "\n");
@@ -394,7 +409,8 @@ async function main(argv: string[]): Promise<number> {
       const limit = intFlag(f, "-n", 40);
       const depth = intFlag(f, "--depth", 1);
       if (depth > 1) {
-        const t = await duTree(es, path, depth, Math.min(limit, 12));
+        // Every expanded folder is another query, so a tree defaults to 12 rows per folder; -n overrides.
+        const t = await duTree(es, path, depth, intFlag(f, "-n", 12));
         out(json ? JSON.stringify(t, null, 2) : renderDuTree(t));
         return 0;
       }
@@ -506,6 +522,28 @@ async function main(argv: string[]): Promise<number> {
     const spec = buildSpec(f, f.positional, DEFAULTS.limit);
     const n = await totalSize(es, spec);
     out(json ? JSON.stringify({ bytes: n, human: humanSize(n) }) : n === null ? "size unavailable from index" : `${n}  (${humanSize(n)})`);
+    return 0;
+  }
+
+  const literal = f.str.get("--grep");
+  const regex = f.str.get("--grep-regex");
+  if (literal !== undefined || regex !== undefined) {
+    if (cmd !== "find") throw new Error(`--grep and --grep-regex go with ev find (got ev ${cmd})`);
+    if (literal !== undefined && regex !== undefined) throw new Error("give --grep or --grep-regex, not both");
+    if (f.str.has("--sort")) throw new Error("--sort does not apply to --grep: matching files come back in path order");
+    const cap = intFlag(f, "--cap", 5000);
+    const spec = buildSpec(f, f.positional, intFlag(f, "-n", DEFAULTS.limit));
+    const r = await grepMain(es, spec, { literal, regex }, { cap, allDirs: f.bool.has("--all-dirs") });
+    if (json) {
+      out(JSON.stringify(r, null, 2));
+      return 0;
+    }
+    const paths = f.bool.has("--paths");
+    out(paths ? r.files.map((x) => x.path).join("\n") : renderGrepLines(r));
+    if (!quiet) {
+      if (paths) process.stderr.write(mainGrepSummary(r, cap) + "\n");
+      else out(mainGrepSummary(r, cap));
+    }
     return 0;
   }
 

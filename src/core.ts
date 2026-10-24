@@ -68,6 +68,9 @@ export interface DuTreeResult {
   entries: DuEntryTree[];
   grandTotal: number;
   depth: number;
+  /** Rows kept per folder, and the share of its parent a folder needs to be expanded. */
+  perLevel: number;
+  minShare: number;
 }
 
 function leafName(p: string): string {
@@ -288,5 +291,5 @@ export async function duTree(
   }
 
   const { entries, grandTotal } = await level(root, depth, 0);
-  return { root, entries, grandTotal, depth };
+  return { root, entries, grandTotal, depth, perLevel, minShare };
 }

@@ -72,6 +72,11 @@ describe("query building", () => {
     expect(buildSearchTokens({ terms: ['"', "  "] })).toEqual([]);
   });
 
+  // Live 2026-10-24: -regex "red dead|walking dead" matched 79; split into words it matched 168.
+  test("a regex is one pattern, never split into words", () => {
+    expect(buildSearchTokens({ terms: ["red dead|walking dead"], regex: true, ext: ["pdf"] })).toEqual(["red dead|walking dead", "ext:pdf"]);
+  });
+
   test("a date with a time becomes the T form; other spaces are refused", () => {
     expect(buildSearchTokens({ terms: [], modifiedAfter: "2026-10-23 10:00" })).toEqual(["dm:>=2026-10-23T10:00"]);
     expect(() => buildSearchTokens({ terms: [], modifiedAfter: "last week" })).toThrow(/without spaces/);

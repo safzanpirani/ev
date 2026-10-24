@@ -31,8 +31,8 @@ export function renderFind(r: FindResult, opts: { showDate?: boolean } = {}): st
   return lines.join("\n");
 }
 
-export function summaryLine(r: FindResult): string {
-  const size = r.totalSize === null ? "size unavailable from index" : `${humanSize(r.totalSize)} total`;
+export function summaryLine(r: FindResult, unknownSize = "size unavailable from index"): string {
+  const size = r.totalSize === null ? unknownSize : `${humanSize(r.totalSize)} total`;
   const scale = `${r.total.toLocaleString()} match${r.total === 1 ? "" : "es"}, ${size}`;
   return r.truncated ? `-- ${scale}; showing ${r.shown}. Raise with -n, page with --offset.` : `-- ${scale}.`;
 }
@@ -60,7 +60,10 @@ export function renderDuTree(t: import("./core.ts").DuTreeResult): string {
     }
   };
   walk(t.entries);
-  lines.push(`-- ${t.root}: ${humanSize(t.grandTotal)} total, expanded ${t.depth} level${t.depth === 1 ? "" : "s"}.`);
+  lines.push(
+    `-- ${t.root}: ${humanSize(t.grandTotal)} total, expanded ${t.depth} level${t.depth === 1 ? "" : "s"}` +
+      ` (largest ${t.perLevel} per folder; folders under ${Math.round(t.minShare * 100)}% of their parent stay closed). Raise with -n.`,
+  );
   return lines.join("\n");
 }
 
@@ -138,11 +141,24 @@ export function renderLinkPlan(
   return lines.join("\n");
 }
 
+function duration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+}
+
 /** One stderr line per progress event, for detached jobs whose log is the only view. */
-export function renderProgress(p: import("./link.ts").Progress): string {
+export function renderProgress(p: import("./link.ts").Progress, elapsedMs?: number): string {
   const pct = p.totalBytes > 0 ? ` (${Math.floor((p.bytes / p.totalBytes) * 100)}%)` : "";
   const verb = p.phase === "hash" ? "hashed" : "linking";
-  return `-- ${verb} ${p.done}/${p.total} files, ${humanSize(p.bytes)}/${humanSize(p.totalBytes)}${pct}  ${p.path}`;
+  let time = "";
+  if (elapsedMs !== undefined) {
+    time = `, ${duration(elapsedMs)} elapsed`;
+    // Bytes set the pace, not files: one 30G model outweighs a thousand configs.
+    if (p.bytes > 0 && p.bytes < p.totalBytes) time += `, ~${duration((elapsedMs * (p.totalBytes - p.bytes)) / p.bytes)} left`;
+  }
+  return `-- ${verb} ${p.done}/${p.total} files, ${humanSize(p.bytes)}/${humanSize(p.totalBytes)}${pct}${time}  ${p.path}`;
 }
 
 export function renderApply(r: import("./link.ts").ApplyResult, journalPath: string): string {

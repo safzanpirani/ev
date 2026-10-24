@@ -30,8 +30,6 @@ export const DUPES_ON_MAC =
 export const LINK_ON_MAC =
   "ev link cannot plan or apply on macOS: it finds candidates through the Everything index on main, its deny-list guards Windows paths rather than macOS app data, and APFS clones would make the reclaim figures wrong. Showing a saved plan and --undo still work.";
 
-export const GREP_OFF_MAC = "--grep and --grep-regex need fsearch's content index, which only exists on macOS. On main, use ripgrep.";
-
 /** The parsed flags cli.ts hands over. */
 export interface MacFlags {
   positional: string[];
