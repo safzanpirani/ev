@@ -8,7 +8,7 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, lstatSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, renameSync, rmSync, statSync, type Dirent, type Stats } from "node:fs";
 import type { DuEntry, DuEntryTree, DuResult, DuTreeResult } from "./core.ts";
 
 export function defaultSizesDb(env: NodeJS.ProcessEnv = process.env): string {
@@ -133,23 +133,30 @@ function nameOf(p: string): string {
   return p.slice(p.lastIndexOf("/") + 1);
 }
 
-/** Folders from the cache, loose files from disk now. */
+/** Folders from the cache, loose files from disk now. A folder the cache lacks is
+ *  known from its directory entry and never stat'ed: lstat on an empty automount
+ *  waits out systemd's 90 s device timeout and then fails with ENODEV. */
 function entries(cache: SizeCache, dir: string): DuEntry[] {
   const folders = cache.children(dir).map((c): DuEntry => ({ path: c.path, name: nameOf(c.path), size: c.bytes, kind: "folder" }));
   const files: DuEntry[] = [];
-  let names: string[] = [];
+  let names: Dirent[] = [];
   try {
-    names = readdirSync(dir);
+    names = readdirSync(dir, { withFileTypes: true });
   } catch {
     // Unreadable now: the folder totals still stand.
   }
   const known = new Set(folders.map((f) => f.name));
-  for (const n of names) {
-    if (known.has(n)) continue;
-    const p = dir === "/" ? `/${n}` : `${dir}/${n}`;
-    const s = lstatSync(p, { throwIfNoEntry: false });
+  for (const d of names) {
+    if (known.has(d.name) || d.isDirectory()) continue;
+    const p = dir === "/" ? `/${d.name}` : `${dir}/${d.name}`;
+    let s: Stats | undefined;
+    try {
+      s = lstatSync(p, { throwIfNoEntry: false });
+    } catch {
+      // Unreadable (EACCES, ENODEV, EIO): leave it out rather than fail the listing.
+    }
     if (!s || s.isDirectory()) continue;
-    files.push({ path: p, name: n, size: s.size, kind: "file" });
+    files.push({ path: p, name: d.name, size: s.size, kind: "file" });
   }
   return [...folders, ...files].sort((a, b) => b.size - a.size);
 }

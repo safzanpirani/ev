@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,6 +49,40 @@ test("du reads folder totals from the cache and loose files from disk", async ()
       cache.close();
     }
   } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(`${root}-db`, { recursive: true, force: true });
+  }
+});
+
+// Papercut 58be5a: `ev du / --depth 3` died on `ENODEV: lstat /mnt/nvme-500gb`, an automount
+// with no disk behind it. Folders must not be stat'ed (their type comes from the directory
+// listing), and a loose file that cannot be stat'ed is left out instead of failing the run.
+test("du lists a folder whose entries cannot be stat'ed", async () => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), "ev-sizes-")));
+  const locked = join(root, "locked");
+  try {
+    await mkdir(join(locked, "cached"), { recursive: true });
+    await mkdir(join(locked, "sleeping-automount"));
+    await writeFile(join(locked, "loose.txt"), "x");
+    const acc = new SizeAccumulator();
+    acc.dir(root);
+    acc.dir(locked);
+    acc.dir(join(locked, "cached"));
+    acc.file(join(locked, "cached", "a.bin"), 500, "1:1", 1);
+    const db = join(`${root}-db`, "sizes.db");
+    await mkdir(`${root}-db`);
+    saveSizes(db, acc);
+    const cache = openSizes(db)!;
+    // Readable but not searchable: readdir works, every lstat inside fails with EACCES.
+    await chmod(locked, 0o444);
+    try {
+      expect(cachedDu(cache, locked, 10).entries.map((e) => [e.name, e.size])).toEqual([["cached", 500]]);
+      expect(cachedDuTree(cache, root, 3, 5).entries.map((e) => e.name)).toEqual(["locked"]);
+    } finally {
+      cache.close();
+    }
+  } finally {
+    await chmod(locked, 0o755).catch(() => {});
     await rm(root, { recursive: true, force: true });
     await rm(`${root}-db`, { recursive: true, force: true });
   }

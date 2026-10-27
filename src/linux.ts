@@ -2,7 +2,7 @@
 // file identities, so every total is as fresh as the moment of the query even
 // though the name index is only as fresh as its last `ev index`. Never prints.
 
-import { lstatSync } from "node:fs";
+import { lstatSync, type Stats } from "node:fs";
 import { queryWords, type QuerySpec, type SortKey } from "./query.ts";
 import { parseWhen } from "./fsquery.ts";
 import type { EsRow } from "./es.ts";
@@ -96,8 +96,15 @@ export function withDates(r: LxRow): LxRow {
   return { ...r, date_modified: localIso(r.mtimeMs), date_created: localIso(r.birthMs) };
 }
 
+/** null for a path that is gone or cannot be stat'ed (EACCES, ENODEV, EIO): one
+ *  unreadable candidate must not fail the whole query. */
 function statRow(p: string): LxRow | null {
-  const s = lstatSync(p, { throwIfNoEntry: false });
+  let s: Stats | undefined;
+  try {
+    s = lstatSync(p, { throwIfNoEntry: false });
+  } catch {
+    return null;
+  }
   if (!s) return null;
   const kind = s.isDirectory() ? "dir" : s.isFile() ? "file" : s.isSymbolicLink() ? "link" : "other";
   const row: LxRow = { filename: p, kind, bytes: kind === "dir" ? 0 : s.size, mtimeMs: s.mtimeMs, birthMs: s.birthtimeMs, id: `${s.dev}:${s.ino}` };

@@ -2,6 +2,10 @@ import { test, expect, describe } from "bun:test";
 import { collect, planQueries, toDu, toDuTree, toDupes, toFind, type LxRow } from "../src/linux.ts";
 import { linuxNotes } from "../src/linuxcli.ts";
 import { automountsToWake, mountPlan, type LocateClient, type PathQuery } from "../src/locate.ts";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const NOW = Date.parse("2026-10-24T12:00:00Z");
 
@@ -162,4 +166,21 @@ test("attached disks behind empty automounts are woken; an absent disk is left a
   ].join("\n");
   const attached = new Set(["/dev/disk/by-uuid/AAA639A7A6397543", "/dev/disk/by-uuid/2EC8AC85C8AC4D41"]);
   expect(automountsToWake(mountinfo, fstab, (p) => attached.has(p))).toEqual(["/mnt/data-750gb"]);
+});
+
+test("a candidate lstat cannot read counts as gone instead of failing the query (papercut 58be5a)", async () => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), "ev-linux-")));
+  const locked = join(root, "locked");
+  try {
+    await mkdir(locked);
+    await writeFile(join(locked, "x.txt"), "x");
+    await writeFile(join(root, "y.txt"), "yy");
+    await chmod(locked, 0o444);
+    const c = await collect(fakeLocate(() => [join(locked, "x.txt"), join(root, "y.txt")]).locate, { terms: [], under: root }, { cap: 100, now: NOW });
+    expect(c.rows.map((r) => [r.filename, r.bytes])).toEqual([[join(root, "y.txt"), 2]]);
+    expect(c.gone).toBe(1);
+  } finally {
+    await chmod(locked, 0o755).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
 });
